@@ -4,6 +4,7 @@ mod config;
 mod lua;
 mod notify;
 mod protocol;
+mod pubsub;
 mod storage;
 mod worker;
 
@@ -134,6 +135,7 @@ pub fn redis_dispatcher(
             None,
             None,
             lua_engine.as_ref(),
+            None,
             &mut conn,
             &args,
             &mut mutated,
@@ -393,6 +395,53 @@ mod tests {
     fn test_unlogged_toggle() {
         assert!(crate::pg_redis_set_unlogged(true));
         assert!(crate::pg_redis_set_unlogged(false));
+    }
+
+    #[pg_test]
+    fn test_pubsub_hub_semantics() {
+        use bytes::Bytes;
+        use tokio::sync::mpsc;
+
+        let hub = crate::pubsub::PubSubHub::new();
+        let (tx1, mut rx1) = mpsc::unbounded_channel();
+        let (tx2, mut rx2) = mpsc::unbounded_channel();
+        hub.register_client(1, tx1);
+        hub.register_client(2, tx2);
+
+        let ch_a = Bytes::from_static(b"wf:order:1");
+        let ch_b = Bytes::from_static(b"wf:order:2");
+
+        // Subscribe + duplicate idempotency
+        assert_eq!(hub.subscribe(1, ch_a.clone()), 1);
+        assert_eq!(hub.subscribe(1, ch_a.clone()), 1);
+        assert_eq!(hub.subscribe(1, ch_b.clone()), 2);
+        assert_eq!(hub.subscribe(2, ch_a.clone()), 1);
+
+        // Publish to 2 subscribers (binary + >8KB payload)
+        let mut big_payload = vec![0u8, 1u8, 0xffu8, b'\r', b'\n'];
+        big_payload.resize(32 * 1024, b'x');
+        let payload = Bytes::from(big_payload);
+        assert_eq!(hub.publish(&ch_a, &payload), 2);
+        assert_eq!(rx1.try_recv().unwrap().payload, payload);
+        assert_eq!(rx2.try_recv().unwrap().payload, payload);
+        assert!(rx1.try_recv().is_err());
+
+        // Unsubscribe one channel
+        assert_eq!(hub.unsubscribe(1, &ch_a), 1);
+        assert_eq!(hub.publish(&ch_a, &Bytes::from_static(b"one")), 1);
+        assert_eq!(rx2.try_recv().unwrap().payload, Bytes::from_static(b"one"));
+        assert!(rx1.try_recv().is_err());
+
+        // Unsubscribe all
+        let acks = hub.unsubscribe_all(1);
+        assert_eq!(acks, vec![(ch_b.clone(), 0)]);
+        assert_eq!(hub.subscription_count(1), 0);
+
+        // Disconnect cleanup via RAII guard
+        {
+            let _guard = crate::pubsub::PubSubClientGuard::new(2, &hub);
+        }
+        assert_eq!(hub.publish(&ch_a, &Bytes::from_static(b"none")), 0);
     }
 }
 

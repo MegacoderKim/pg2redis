@@ -82,6 +82,17 @@ services:
         condition: service_healthy
     profiles: ["test"]
 
+  test-pubsub:
+    build:
+      context: ./tests/clients/pubsub
+    environment:
+      REDIS_HOST: pg-redis
+      REDIS_PORT: "6379"
+    depends_on:
+      pg-redis:
+        condition: service_healthy
+    profiles: ["test"]
+
   docs:
     build:
       context: .

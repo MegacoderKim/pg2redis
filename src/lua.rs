@@ -16,6 +16,7 @@ use std::io::Cursor;
 use crate::cache::L1Cache;
 use crate::commands::{dispatch_from_lua, ConnectionState};
 use crate::protocol::{format_score, RespValue};
+use crate::pubsub::PubSubHub;
 use crate::storage::PreparedPlans;
 
 static CJSON_NULL_SENTINEL: u8 = 0;
@@ -111,6 +112,7 @@ impl LuaEngine {
         client: &mut SpiClient,
         plans: Option<&PreparedPlans>,
         cache: Option<&L1Cache>,
+        pubsub: Option<&PubSubHub>,
         conn: &mut ConnectionState,
         mutated_keys: &mut Vec<String>,
     ) -> RespValue {
@@ -125,6 +127,7 @@ impl LuaEngine {
             client,
             plans,
             cache,
+            pubsub,
             conn,
             mutated_keys,
         )
@@ -138,6 +141,7 @@ impl LuaEngine {
         client: &mut SpiClient,
         plans: Option<&PreparedPlans>,
         cache: Option<&L1Cache>,
+        pubsub: Option<&PubSubHub>,
         conn: &mut ConnectionState,
         mutated_keys: &mut Vec<String>,
     ) -> RespValue {
@@ -166,6 +170,7 @@ impl LuaEngine {
             client: &'a mut SpiClient<'conn>,
             plans: Option<&'a PreparedPlans>,
             cache: Option<&'a L1Cache>,
+            pubsub: Option<&'a PubSubHub>,
             conn: &'a mut ConnectionState,
             mutated_keys: &'a mut Vec<String>,
         }
@@ -174,6 +179,7 @@ impl LuaEngine {
             client,
             plans,
             cache,
+            pubsub,
             conn,
             mutated_keys,
         });
@@ -202,6 +208,7 @@ impl LuaEngine {
                             ctx.client,
                             ctx.plans,
                             ctx.cache,
+                            ctx.pubsub,
                             ctx.conn,
                             &cmd_args,
                             ctx.mutated_keys,
@@ -321,7 +328,7 @@ fn resp_to_lua(lua: &Lua, value: RespValue) -> LuaResult<LuaValue> {
             t.raw_set("err", e)?;
             Ok(LuaValue::Table(t))
         }
-        RespValue::Array(items) => {
+        RespValue::Array(items) | RespValue::Push(items) => {
             let t = lua.create_table_with_capacity(items.len(), 0)?;
             for (i, item) in items.into_iter().enumerate() {
                 t.raw_set((i + 1) as i64, resp_to_lua(lua, item)?)?;

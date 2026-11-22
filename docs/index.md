@@ -7,12 +7,12 @@ hide:
 <div class="hero-banner" markdown>
 
 <div class="hero-badges">
-  <span class="hero-badge">PostgreSQL 15+</span>
+  <span class="hero-badge">PostgreSQL 15 &amp; 16</span>
   <span class="hero-badge">Rust + pgrx 0.11</span>
   <span class="hero-badge">RESP2 &amp; RESP3</span>
+  <span class="hero-badge">Pub/Sub (ioredis 5.11)</span>
   <span class="hero-badge">Lua 5.1 (EVAL/EVALSHA)</span>
   <span class="hero-badge">BullMQ 5.13 Ready</span>
-  <span class="hero-badge">L1 moka Cache</span>
 </div>
 
 # pg_redis_core

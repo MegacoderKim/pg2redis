@@ -1,11 +1,15 @@
 # syntax=docker/dockerfile:1.7
 
-FROM postgres:15-bookworm AS builder-base
+ARG PG_MAJOR=15
 
+FROM postgres:${PG_MAJOR}-bookworm AS builder-base
+
+ARG PG_MAJOR=15
+ENV PG_MAJOR=${PG_MAJOR}
 ENV DEBIAN_FRONTEND=noninteractive
 ENV RUSTUP_HOME=/usr/local/rustup
 ENV CARGO_HOME=/usr/local/cargo
-ENV PATH=/usr/local/cargo/bin:/usr/lib/postgresql/15/bin:$PATH
+ENV PATH=/usr/local/cargo/bin:/usr/lib/postgresql/${PG_MAJOR}/bin:$PATH
 ENV PGRX_VERSION=0.11.4
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -24,7 +28,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     clang \
     libclang-dev \
     llvm-dev \
-    postgresql-server-dev-15 \
+    postgresql-server-dev-${PG_MAJOR} \
     && rm -rf /var/lib/apt/lists/*
 
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
@@ -34,10 +38,11 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
 RUN cargo install cargo-pgrx --version ${PGRX_VERSION} --locked \
     && chmod -R a+rX /usr/local/cargo
 
-RUN cargo pgrx init --pg15 /usr/lib/postgresql/15/bin/pg_config
+RUN cargo pgrx init --pg${PG_MAJOR} /usr/lib/postgresql/${PG_MAJOR}/bin/pg_config
 
 FROM builder-base AS builder
 
+ARG PG_MAJOR=15
 WORKDIR /build
 COPY Cargo.toml pg_redis_core.control ./
 COPY src ./src
@@ -45,31 +50,33 @@ COPY sql ./sql
 
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
-    --mount=type=cache,target=/build/target \
-    cargo pgrx package --pg-config /usr/lib/postgresql/15/bin/pg_config --no-default-features --features pg15 \
+    --mount=type=cache,id=target-pg${PG_MAJOR},target=/build/target \
+    cargo pgrx package --pg-config /usr/lib/postgresql/${PG_MAJOR}/bin/pg_config --no-default-features --features pg${PG_MAJOR} \
     && mkdir -p /out \
-    && cp -a /build/target/release/pg_redis_core-pg15/. /out/ \
-    && cp -a /build/sql/*.sql /out/usr/share/postgresql/15/extension/
+    && cp -a /build/target/release/pg_redis_core-pg${PG_MAJOR}/. /out/ \
+    && cp -a /build/sql/*.sql /out/usr/share/postgresql/${PG_MAJOR}/extension/
 
 FROM builder-base AS dev
 
+ARG PG_MAJOR=15
+ENV PG_MAJOR=${PG_MAJOR}
 WORKDIR /build
 RUN mkdir -p /var/lib/postgresql/.pgrx \
     && chown -R postgres:postgres \
         /build \
         /usr/local/cargo \
         /var/lib/postgresql \
-        /usr/lib/postgresql/15/lib \
-        /usr/share/postgresql/15/extension
+        /usr/lib/postgresql/${PG_MAJOR}/lib \
+        /usr/share/postgresql/${PG_MAJOR}/extension
 USER postgres
 ENV USER=postgres
-RUN cargo pgrx init --pg15 /usr/lib/postgresql/15/bin/pg_config
+RUN cargo pgrx init --pg${PG_MAJOR} /usr/lib/postgresql/${PG_MAJOR}/bin/pg_config
 COPY --chown=postgres:postgres Cargo.toml pg_redis_core.control ./
 COPY --chown=postgres:postgres src ./src
 RUN cargo fetch
-CMD ["cargo", "pgrx", "test", "pg15"]
+CMD ["sh", "-c", "cargo pgrx test pg${PG_MAJOR} --no-default-features --features pg${PG_MAJOR}"]
 
-FROM postgres:15-bookworm AS runtime
+FROM postgres:${PG_MAJOR}-bookworm AS runtime
 
 # Install redis-tools (redis-cli) and netcat for healthchecks & local diagnostics
 RUN apt-get update && apt-get install -y --no-install-recommends \

@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release git tag to build and publish (e.g. v0.2.0)"
+        description: "Release git tag to build and publish (e.g. v0.3.0)"
         required: true
         type: string
       prerelease:
@@ -16,7 +16,7 @@ on:
         default: false
         type: boolean
       publish_docker:
-        description: "Publish multi-arch Docker image to GHCR"
+        description: "Publish multi-arch Docker images to GHCR"
         required: false
         default: true
         type: boolean
@@ -102,17 +102,27 @@ jobs:
           mkdocs build --strict -d /tmp/site
 
   build:
-    name: Build & Smoke Test (${{ matrix.arch }})
+    name: Build & Smoke Test (PG${{ matrix.pg_major }} / ${{ matrix.arch }})
     needs: validate
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - arch: amd64
+          - pg_major: "15"
+            arch: amd64
             platform: linux/amd64
             runner: ubuntu-latest
-          - arch: arm64
+          - pg_major: "15"
+            arch: arm64
+            platform: linux/arm64
+            runner: ubuntu-24.04-arm
+          - pg_major: "16"
+            arch: amd64
+            platform: linux/amd64
+            runner: ubuntu-latest
+          - pg_major: "16"
+            arch: arm64
             platform: linux/arm64
             runner: ubuntu-24.04-arm
     steps:
@@ -138,24 +148,29 @@ jobs:
           context: .
           file: docker/Dockerfile
           target: builder
+          build-args: PG_MAJOR=${{ matrix.pg_major }}
           platforms: ${{ matrix.platform }}
           load: true
-          tags: pg_redis_core:builder-${{ matrix.arch }}
-          cache-from: type=gha,scope=builder-${{ matrix.arch }}
-          cache-to: type=gha,mode=max,scope=builder-${{ matrix.arch }}
+          tags: pg_redis_core:builder-pg${{ matrix.pg_major }}-${{ matrix.arch }}
+          cache-from: type=gha,scope=builder-pg${{ matrix.pg_major }}-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=builder-pg${{ matrix.pg_major }}-${{ matrix.arch }}
 
-      - name: Package PostgreSQL 15 extension tarball
+      - name: Package PostgreSQL ${{ matrix.pg_major }} extension tarball
         run: |
           VERSION="${{ needs.validate.outputs.version }}"
+          PG_MAJOR="${{ matrix.pg_major }}"
           ARCH="${{ matrix.arch }}"
-          ARCHIVE="pg_redis_core-${VERSION}-pg15-linux-${ARCH}.tar.gz"
+          ARCHIVE="pg_redis_core-${VERSION}-pg${PG_MAJOR}-linux-${ARCH}.tar.gz"
           mkdir -p dist/pkg
-          CID=$(docker create "pg_redis_core:builder-${ARCH}")
+          CID=$(docker create "pg_redis_core:builder-pg${PG_MAJOR}-${ARCH}")
           docker cp "${CID}:/out/." dist/pkg/
           docker rm "${CID}"
           tar -C dist/pkg -czf "dist/${ARCHIVE}" .
           (cd dist && sha256sum "${ARCHIVE}" > "${ARCHIVE}.sha256")
+          echo "=== Tarball SHA-256 ==="
           cat "dist/${ARCHIVE}.sha256"
+          echo "=== Shared library (.so) SHA-256 ==="
+          sha256sum "dist/pkg/usr/lib/postgresql/${PG_MAJOR}/lib/pg_redis_core.so"
 
       - name: Build runtime image for smoke testing
         uses: docker/build-push-action@v6
@@ -163,17 +178,19 @@ jobs:
           context: .
           file: docker/Dockerfile
           target: runtime
+          build-args: PG_MAJOR=${{ matrix.pg_major }}
           platforms: ${{ matrix.platform }}
           load: true
-          tags: pg_redis_core:smoke-${{ matrix.arch }}
-          cache-from: type=gha,scope=builder-${{ matrix.arch }}
+          tags: pg_redis_core:smoke-pg${{ matrix.pg_major }}-${{ matrix.arch }}
+          cache-from: type=gha,scope=builder-pg${{ matrix.pg_major }}-${{ matrix.arch }}
 
-      - name: Smoke test packaged runtime image (PG15 + RESP + Lua + Streams)
+      - name: Smoke test packaged runtime image (PG${{ matrix.pg_major }} + RESP + Lua + Streams + Pub/Sub)
         run: |
           VERSION="${{ needs.validate.outputs.version }}"
+          PG_MAJOR="${{ matrix.pg_major }}"
           docker run -d --name pg_smoke \
             -e POSTGRES_PASSWORD=postgres \
-            "pg_redis_core:smoke-${{ matrix.arch }}"
+            "pg_redis_core:smoke-pg${PG_MAJOR}-${{ matrix.arch }}"
           trap 'docker logs pg_smoke || true; docker rm -f pg_smoke || true' EXIT
 
           for i in $(seq 1 30); do
@@ -184,11 +201,20 @@ jobs:
             sleep 1
           done
 
+          docker exec pg_smoke psql -U postgres -tAc "SHOW server_version;" | grep -qE "^${PG_MAJOR}\."
           docker exec pg_smoke redis-cli PING | grep -q PONG
           docker exec pg_smoke redis-cli INFO | grep -q "pg_redis_core_version:${VERSION}"
           docker exec pg_smoke redis-cli EVAL "return redis.call('XADD', KEYS[1], '*', 'event', 'release_ok')" 1 smoke:stream | grep -qE '^[0-9]+-[0-9]+$'
+          docker exec pg_smoke redis-cli PUBLISH smoke:pubsub hello | grep -qx "0"
+          docker exec pg_smoke sh -ec "
+            (sleep 1; redis-cli PUBLISH smoke:pubsub delivered > /tmp/pub_cnt) &
+            PUB_PID=\$!
+            timeout 5 stdbuf -oL redis-cli --csv SUBSCRIBE smoke:pubsub | head -n 3 | grep -q '\"delivered\"'
+            wait \$PUB_PID
+            grep -qx '1' /tmp/pub_cnt
+          "
           docker exec pg_smoke psql -U postgres -tAc "SELECT extversion FROM pg_extension WHERE extname = 'pg_redis_core';" | grep -qx "${VERSION}"
-          echo "Smoke test PASSED for linux/${{ matrix.arch }} v${VERSION}"
+          echo "Smoke test PASSED for PG${PG_MAJOR} linux/${{ matrix.arch }} v${VERSION}"
 
       - name: Push platform image to GHCR by digest
         if: needs.validate.outputs.publish_docker == 'true'
@@ -198,9 +224,10 @@ jobs:
           context: .
           file: docker/Dockerfile
           target: runtime
+          build-args: PG_MAJOR=${{ matrix.pg_major }}
           platforms: ${{ matrix.platform }}
           outputs: type=image,name=${{ needs.validate.outputs.image_repo }},push-by-digest=true,name-canonical=true,push=true
-          cache-from: type=gha,scope=builder-${{ matrix.arch }}
+          cache-from: type=gha,scope=builder-pg${{ matrix.pg_major }}-${{ matrix.arch }}
 
       - name: Export image digest
         if: needs.validate.outputs.publish_docker == 'true'
@@ -213,7 +240,7 @@ jobs:
         if: needs.validate.outputs.publish_docker == 'true'
         uses: actions/upload-artifact@v4
         with:
-          name: digest-${{ matrix.arch }}
+          name: digest-pg${{ matrix.pg_major }}-${{ matrix.arch }}
           path: digests/*
           if-no-files-found: error
           retention-days: 1
@@ -221,7 +248,7 @@ jobs:
       - name: Upload extension tarball artifact
         uses: actions/upload-artifact@v4
         with:
-          name: extension-${{ matrix.arch }}
+          name: extension-pg${{ matrix.pg_major }}-${{ matrix.arch }}
           path: |
             dist/*.tar.gz
             dist/*.sha256
@@ -229,15 +256,19 @@ jobs:
           retention-days: 1
 
   merge-docker-manifest:
-    name: Publish Multi-Arch Docker Manifest (GHCR)
+    name: Publish Multi-Arch Docker Manifest (PG${{ matrix.pg_major }})
     needs: [validate, build]
     if: needs.validate.outputs.publish_docker == 'true'
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        pg_major: ["15", "16"]
     steps:
       - name: Download platform digests
         uses: actions/download-artifact@v4
         with:
-          pattern: digest-*
+          pattern: digest-pg${{ matrix.pg_major }}-*
           path: /tmp/digests
           merge-multiple: true
 
@@ -257,16 +288,23 @@ jobs:
           TAG="${{ needs.validate.outputs.tag }}"
           MAJOR_MINOR="${{ needs.validate.outputs.major_minor }}"
           PRERELEASE="${{ needs.validate.outputs.prerelease }}"
+          PG_MAJOR="${{ matrix.pg_major }}"
 
           SOURCES=$(printf "${IMAGE}@sha256:%s " $(ls /tmp/digests))
-          TAG_ARGS="-t ${IMAGE}:${TAG} -t ${IMAGE}:${TAG#v}"
+          TAG_ARGS="-t ${IMAGE}:${TAG}-pg${PG_MAJOR} -t ${IMAGE}:${TAG#v}-pg${PG_MAJOR}"
           if [ "${PRERELEASE}" != "true" ]; then
-            TAG_ARGS="${TAG_ARGS} -t ${IMAGE}:${MAJOR_MINOR} -t ${IMAGE}:latest"
+            TAG_ARGS="${TAG_ARGS} -t ${IMAGE}:${MAJOR_MINOR}-pg${PG_MAJOR} -t ${IMAGE}:pg${PG_MAJOR}"
+          fi
+          if [ "${PG_MAJOR}" = "15" ]; then
+            TAG_ARGS="${TAG_ARGS} -t ${IMAGE}:${TAG} -t ${IMAGE}:${TAG#v}"
+            if [ "${PRERELEASE}" != "true" ]; then
+              TAG_ARGS="${TAG_ARGS} -t ${IMAGE}:${MAJOR_MINOR} -t ${IMAGE}:latest"
+            fi
           fi
 
           # shellcheck disable=SC2086
           docker buildx imagetools create ${TAG_ARGS} ${SOURCES}
-          docker buildx imagetools inspect "${IMAGE}:${TAG}"
+          docker buildx imagetools inspect "${IMAGE}:${TAG}-pg${PG_MAJOR}"
 
   publish-release:
     name: Create / Update GitHub Release
@@ -309,8 +347,12 @@ jobs:
             echo "Release ${TAG} of \`pg_redis_core\`." > release-notes.md
           fi
 
+          printf '\n### Prebuilt Extension Binaries (SHA-256)\n\n```text\n' >> release-notes.md
+          cat release-assets/SHA256SUMS.txt >> release-notes.md
+          printf '```\n' >> release-notes.md
+
           if [ "${{ needs.validate.outputs.publish_docker }}" = "true" ]; then
-            printf '\n### Docker Image (Multi-Arch: `linux/amd64`, `linux/arm64`)\n\n```bash\ndocker pull %s:%s\n```\n\n### Documentation\nhttps://megacoderkim.github.io/pg2redis/\n' "${IMAGE}" "${TAG}" >> release-notes.md
+            printf '\n### Docker Images (Multi-Arch: `linux/amd64`, `linux/arm64`)\n\n```bash\n# PostgreSQL 15\ndocker pull %s:%s-pg15\n\n# PostgreSQL 16\ndocker pull %s:%s-pg16\n```\n\n### Documentation\nhttps://megacoderkim.github.io/pg2redis/\n' "${IMAGE}" "${TAG}" "${IMAGE}" "${TAG}" >> release-notes.md
           fi
 
       - name: Publish GitHub Release
