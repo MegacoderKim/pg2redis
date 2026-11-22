@@ -46,6 +46,25 @@ Or run a strict production build check:
 docker compose --profile docs run --rm docs mkdocs build --strict
 ```
 
+## Branching & GitHub Actions Release Workflow
+
+All changes follow a branch-and-PR workflow into `main`:
+
+1. Create a feature branch from `main`:
+   ```bash
+   git checkout -b feat/my-change
+   ```
+2. Commit changes, push the branch, and open a Pull Request against `main`.
+3. GitHub Actions CI (`.github/workflows/ci.yml`) validates `mkdocs build --strict` and the full Dockerized integration + `cargo pgrx test pg15` suite before merge.
+4. To cut a release (`vX.Y.Z`):
+   - Bump `version` in `Cargo.toml`, add a `sql/pg_redis_core--<prev>--<next>.sql` upgrade script if schema changed, and update `CHANGELOG.md` via PR.
+   - Tag `main` and push the tag (or trigger **Release** manually from the GitHub Actions UI with `workflow_dispatch`):
+     ```bash
+     git tag -a v0.3.0 -m "pg_redis_core v0.3.0"
+     git push origin v0.3.0
+     ```
+   - `.github/workflows/release.yml` validates version parity, natively builds & smoke-tests both `linux/amd64` and `linux/arm64` PostgreSQL 15 extension tarballs, publishes a multi-arch Docker image to `ghcr.io/megacoderkim/pg2redis`, and creates the GitHub Release with `SHA256SUMS.txt`.
+
 ## Project Layout
 
 ```text

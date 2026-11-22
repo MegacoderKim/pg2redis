@@ -1,54 +1,334 @@
-name: Release Extension Artifacts
+name: Release
 
 on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release git tag to build and publish (e.g. v0.2.0)"
+        required: true
+        type: string
+      prerelease:
+        description: "Mark GitHub Release as a pre-release"
+        required: false
+        default: false
+        type: boolean
+      publish_docker:
+        description: "Publish multi-arch Docker image to GHCR"
+        required: false
+        default: true
+        type: boolean
 
 permissions:
   contents: write
+  packages: write
+  id-token: write
+
+concurrency:
+  group: release-${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+  cancel-in-progress: false
 
 jobs:
-  build-linux-amd64:
+  validate:
+    name: Validate Release Metadata & Docs
     runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+      version: ${{ steps.meta.outputs.version }}
+      major_minor: ${{ steps.meta.outputs.major_minor }}
+      prerelease: ${{ steps.meta.outputs.prerelease }}
+      publish_docker: ${{ steps.meta.outputs.publish_docker }}
+      image_repo: ${{ steps.meta.outputs.image_repo }}
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Build packaged extension (PostgreSQL 15, linux-amd64)
+      - name: Resolve release metadata
+        id: meta
         run: |
-          TAG="${GITHUB_REF_NAME}"
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG="${{ inputs.tag }}"
+            PRERELEASE="${{ inputs.prerelease }}"
+            PUBLISH_DOCKER="${{ inputs.publish_docker }}"
+          else
+            TAG="${GITHUB_REF_NAME}"
+            if echo "${TAG}" | grep -qE '-'; then
+              PRERELEASE="true"
+            else
+              PRERELEASE="false"
+            fi
+            PUBLISH_DOCKER="true"
+          fi
+
+          if ! echo "${TAG}" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.]+)?$'; then
+            echo "Invalid semver tag '${TAG}' (expected vX.Y.Z)" >&2
+            exit 1
+          fi
+
           VERSION="${TAG#v}"
-          docker build --target builder -f docker/Dockerfile -t pg_redis_core:builder .
-          CID=$(docker create pg_redis_core:builder)
+          MAJOR_MINOR="$(echo "${VERSION}" | cut -d. -f1,2)"
+          IMAGE_REPO="ghcr.io/$(echo "${GITHUB_REPOSITORY}" | tr '[:upper:]' '[:lower:]')"
+
+          echo "tag=${TAG}" >> "${GITHUB_OUTPUT}"
+          echo "version=${VERSION}" >> "${GITHUB_OUTPUT}"
+          echo "major_minor=${MAJOR_MINOR}" >> "${GITHUB_OUTPUT}"
+          echo "prerelease=${PRERELEASE}" >> "${GITHUB_OUTPUT}"
+          echo "publish_docker=${PUBLISH_DOCKER}" >> "${GITHUB_OUTPUT}"
+          echo "image_repo=${IMAGE_REPO}" >> "${GITHUB_OUTPUT}"
+
+      - name: Checkout target tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.meta.outputs.tag }}
+
+      - name: Verify Cargo.toml version matches tag
+        run: |
+          CARGO_VER=$(grep -m1 '^version = ' Cargo.toml | sed -E 's/version = "([^"]+)"/\1/')
+          EXPECTED="${{ steps.meta.outputs.version }}"
+          echo "Cargo.toml version: ${CARGO_VER} | Expected: ${EXPECTED}"
+          if [ "${CARGO_VER}" != "${EXPECTED}" ]; then
+            echo "ERROR: Cargo.toml version (${CARGO_VER}) does not match tag (${EXPECTED})" >&2
+            exit 1
+          fi
+
+      - name: Validate MkDocs build
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: |
+          pip install --no-cache-dir \
+            mkdocs==1.6.1 \
+            mkdocs-material==9.6.7 \
+            pymdown-extensions==10.14.3
+          mkdocs build --strict -d /tmp/site
+
+  build:
+    name: Build & Smoke Test (${{ matrix.arch }})
+    needs: validate
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            platform: linux/amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            platform: linux/arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - name: Checkout target tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.validate.outputs.tag }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        if: needs.validate.outputs.publish_docker == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build builder target (cached)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile
+          target: builder
+          platforms: ${{ matrix.platform }}
+          load: true
+          tags: pg_redis_core:builder-${{ matrix.arch }}
+          cache-from: type=gha,scope=builder-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=builder-${{ matrix.arch }}
+
+      - name: Package PostgreSQL 15 extension tarball
+        run: |
+          VERSION="${{ needs.validate.outputs.version }}"
+          ARCH="${{ matrix.arch }}"
+          ARCHIVE="pg_redis_core-${VERSION}-pg15-linux-${ARCH}.tar.gz"
           mkdir -p dist/pkg
+          CID=$(docker create "pg_redis_core:builder-${ARCH}")
           docker cp "${CID}:/out/." dist/pkg/
           docker rm "${CID}"
-          tar -C dist/pkg -czf "dist/pg_redis_core-${VERSION}-pg15-linux-amd64.tar.gz" .
-          (cd dist && sha256sum "pg_redis_core-${VERSION}-pg15-linux-amd64.tar.gz" > "pg_redis_core-${VERSION}-pg15-linux-amd64.tar.gz.sha256")
+          tar -C dist/pkg -czf "dist/${ARCHIVE}" .
+          (cd dist && sha256sum "${ARCHIVE}" > "${ARCHIVE}.sha256")
+          cat "dist/${ARCHIVE}.sha256"
 
-      - name: Upload linux-amd64 artifact to GitHub Release
-        env:
-          GH_TOKEN: ${{ github.token }}
+      - name: Build runtime image for smoke testing
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile
+          target: runtime
+          platforms: ${{ matrix.platform }}
+          load: true
+          tags: pg_redis_core:smoke-${{ matrix.arch }}
+          cache-from: type=gha,scope=builder-${{ matrix.arch }}
+
+      - name: Smoke test packaged runtime image (PG15 + RESP + Lua + Streams)
         run: |
-          TAG="${GITHUB_REF_NAME}"
-          VERSION="${TAG#v}"
-          # Wait briefly if release is being created concurrently
-          for i in 1 2 3 4 5; do
-            if gh release view "${TAG}" >/dev/null 2>&1; then
+          VERSION="${{ needs.validate.outputs.version }}"
+          docker run -d --name pg_smoke \
+            -e POSTGRES_PASSWORD=postgres \
+            "pg_redis_core:smoke-${{ matrix.arch }}"
+          trap 'docker logs pg_smoke || true; docker rm -f pg_smoke || true' EXIT
+
+          for i in $(seq 1 30); do
+            if docker exec pg_smoke pg_isready -U postgres -d postgres >/dev/null 2>&1 \
+              && docker exec pg_smoke redis-cli -h 127.0.0.1 -p 6379 PING 2>/dev/null | grep -q PONG; then
               break
             fi
-            sleep 3
+            sleep 1
           done
+
+          docker exec pg_smoke redis-cli PING | grep -q PONG
+          docker exec pg_smoke redis-cli INFO | grep -q "pg_redis_core_version:${VERSION}"
+          docker exec pg_smoke redis-cli EVAL "return redis.call('XADD', KEYS[1], '*', 'event', 'release_ok')" 1 smoke:stream | grep -qE '^[0-9]+-[0-9]+$'
+          docker exec pg_smoke psql -U postgres -tAc "SELECT extversion FROM pg_extension WHERE extname = 'pg_redis_core';" | grep -qx "${VERSION}"
+          echo "Smoke test PASSED for linux/${{ matrix.arch }} v${VERSION}"
+
+      - name: Push platform image to GHCR by digest
+        if: needs.validate.outputs.publish_docker == 'true'
+        id: push_img
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile
+          target: runtime
+          platforms: ${{ matrix.platform }}
+          outputs: type=image,name=${{ needs.validate.outputs.image_repo }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=builder-${{ matrix.arch }}
+
+      - name: Export image digest
+        if: needs.validate.outputs.publish_docker == 'true'
+        run: |
+          mkdir -p digests
+          DIGEST="${{ steps.push_img.outputs.digest }}"
+          touch "digests/${DIGEST#sha256:}"
+
+      - name: Upload image digest artifact
+        if: needs.validate.outputs.publish_docker == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: digest-${{ matrix.arch }}
+          path: digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Upload extension tarball artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: extension-${{ matrix.arch }}
+          path: |
+            dist/*.tar.gz
+            dist/*.sha256
+          if-no-files-found: error
+          retention-days: 1
+
+  merge-docker-manifest:
+    name: Publish Multi-Arch Docker Manifest (GHCR)
+    needs: [validate, build]
+    if: needs.validate.outputs.publish_docker == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download platform digests
+        uses: actions/download-artifact@v4
+        with:
+          pattern: digest-*
+          path: /tmp/digests
+          merge-multiple: true
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create and push multi-arch manifest list
+        run: |
+          IMAGE="${{ needs.validate.outputs.image_repo }}"
+          TAG="${{ needs.validate.outputs.tag }}"
+          MAJOR_MINOR="${{ needs.validate.outputs.major_minor }}"
+          PRERELEASE="${{ needs.validate.outputs.prerelease }}"
+
+          SOURCES=$(printf "${IMAGE}@sha256:%s " $(ls /tmp/digests))
+          TAG_ARGS="-t ${IMAGE}:${TAG} -t ${IMAGE}:${TAG#v}"
+          if [ "${PRERELEASE}" != "true" ]; then
+            TAG_ARGS="${TAG_ARGS} -t ${IMAGE}:${MAJOR_MINOR} -t ${IMAGE}:latest"
+          fi
+
+          # shellcheck disable=SC2086
+          docker buildx imagetools create ${TAG_ARGS} ${SOURCES}
+          docker buildx imagetools inspect "${IMAGE}:${TAG}"
+
+  publish-release:
+    name: Create / Update GitHub Release
+    needs: [validate, build, merge-docker-manifest]
+    if: >-
+      always()
+      && needs.validate.result == 'success'
+      && needs.build.result == 'success'
+      && (needs.merge-docker-manifest.result == 'success' || needs.merge-docker-manifest.result == 'skipped')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout target tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.validate.outputs.tag }}
+
+      - name: Download extension tarballs
+        uses: actions/download-artifact@v4
+        with:
+          pattern: extension-*
+          path: release-assets
+          merge-multiple: true
+
+      - name: Generate combined SHA256SUMS.txt & release notes
+        run: |
+          VERSION="${{ needs.validate.outputs.version }}"
+          TAG="${{ needs.validate.outputs.tag }}"
+          IMAGE="${{ needs.validate.outputs.image_repo }}"
+
+          cat release-assets/*.sha256 | sort > release-assets/SHA256SUMS.txt
+
+          # Extract version notes from CHANGELOG.md if present
+          awk -v ver="${VERSION}" '
+            $0 ~ "^## \\[" ver "\\]" { found=1; next }
+            found && /^## \[/ { exit }
+            found { print }
+          ' CHANGELOG.md > release-notes.md || true
+
+          if [ ! -s release-notes.md ]; then
+            echo "Release ${TAG} of \`pg_redis_core\`." > release-notes.md
+          fi
+
+          if [ "${{ needs.validate.outputs.publish_docker }}" = "true" ]; then
+            printf '\n### Docker Image (Multi-Arch: `linux/amd64`, `linux/arm64`)\n\n```bash\ndocker pull %s:%s\n```\n\n### Documentation\nhttps://megacoderkim.github.io/pg2redis/\n' "${IMAGE}" "${TAG}" >> release-notes.md
+          fi
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ needs.validate.outputs.tag }}"
+          PRERELEASE_FLAG=""
+          if [ "${{ needs.validate.outputs.prerelease }}" = "true" ]; then
+            PRERELEASE_FLAG="--prerelease"
+          fi
+
           if gh release view "${TAG}" >/dev/null 2>&1; then
-            gh release upload "${TAG}" \
-              "dist/pg_redis_core-${VERSION}-pg15-linux-amd64.tar.gz" \
-              "dist/pg_redis_core-${VERSION}-pg15-linux-amd64.tar.gz.sha256" \
-              --clobber
+            gh release upload "${TAG}" release-assets/* --clobber
+            gh release edit "${TAG}" --notes-file release-notes.md ${PRERELEASE_FLAG}
           else
-            gh release create "${TAG}" \
-              "dist/pg_redis_core-${VERSION}-pg15-linux-amd64.tar.gz" \
-              "dist/pg_redis_core-${VERSION}-pg15-linux-amd64.tar.gz.sha256" \
+            gh release create "${TAG}" release-assets/* \
               --title "pg_redis_core ${TAG}" \
-              --generate-notes
+              --notes-file release-notes.md \
+              ${PRERELEASE_FLAG}
           fi
