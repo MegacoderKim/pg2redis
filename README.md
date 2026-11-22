@@ -12,6 +12,8 @@
 ## Architecture
 
 - **Embedded RESP Listener (`src/worker.rs`, `src/protocol.rs`):** A PostgreSQL background worker runs a single-threaded Tokio (`current_thread` + `LocalSet`) TCP server on `0.0.0.0:6379` with zero-copy `redis-protocol` 6.0 frame parsing, RESP2 & RESP3 (`HELLO 3`) negotiation, and inline command support.
+- **Embedded Lua 5.1 Scripting (`src/lua.rs`):** Vendored Lua 5.1 via `mlua` supporting `EVAL`, `EVALSHA`, `SCRIPT LOAD/EXISTS/FLUSH`, `cjson`, `cmsgpack`, `bit`, and atomic `redis.call`/`pcall` execution inside PostgreSQL SPI transactions.
+- **Streams, Sets & Cooperative Blocking (`src/commands/streams.rs`, `src/commands/sets.rs`, `src/notify.rs`):** Full `XADD`, `XTRIM`, `XREAD [BLOCK]`, `XRANGE`, `XLEN`, `BZPOPMIN`, `BZPOPMAX`, `BLPOP`, `BRPOP`, `ZPOPMIN`, `SADD`/`SMEMBERS` — verified end-to-end with **BullMQ 5.13.0** (Medusa queues).
 - **Pipelining & Frame Batching (`src/commands/mod.rs`):** Multiple pipelined frames arriving over a socket are batched into a single PostgreSQL SPI transaction. Full `MULTI` / `EXEC` / `DISCARD` transactions are also supported.
 - **Prepared SPI Plans (`src/storage.rs`):** High-frequency queries (`GET`, `SET`, `HGET`, `HSET`, `HGETALL`, `ZSCORE`, TTL eviction) are pre-prepared and retained across transactions via `SPI_keepplan`.
 - **In-Process L1 Hot-Key Cache (`src/cache.rs`):** Backed by `moka::sync::Cache`, serving hot string `GET` hits directly from worker memory with exact TTL awareness and immediate write-through invalidation.

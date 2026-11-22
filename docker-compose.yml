@@ -71,6 +71,17 @@ services:
         condition: service_healthy
     profiles: ["test"]
 
+  test-bullmq:
+    build:
+      context: ./tests/clients/bullmq
+    environment:
+      REDIS_HOST: pg-redis
+      REDIS_PORT: "6379"
+    depends_on:
+      pg-redis:
+        condition: service_healthy
+    profiles: ["test"]
+
   docs:
     build:
       context: .

@@ -186,6 +186,9 @@ pub fn cmd_info(cache: Option<&L1Cache>) -> RespValue {
          pg_database:{}\r\n\
          pg_unlogged:{}\r\n\
          \r\n\
+         # Memory\r\n\
+         maxmemory_policy:noeviction\r\n\
+         \r\n\
          # Stats\r\n\
          {}\r\n\
          # Replication\r\n\
@@ -207,6 +210,7 @@ pub fn cmd_config(args: &[Bytes]) -> RespValue {
             ("databases", "1".to_string()),
             ("save", "".to_string()),
             ("appendonly", "yes".to_string()),
+            ("maxmemory-policy", "noeviction".to_string()),
             ("port", config::port().to_string()),
         ];
         let mut pairs = Vec::new();

@@ -1,6 +1,6 @@
 # Supported Redis Commands
 
-`pg_redis_core` supports **60+ Redis commands** over both **RESP2** and **RESP3** (plus inline commands), covering Strings, Keys/Expiry, Hashes, Lists, Sorted Sets, Transactions, and Server/Driver handshakes.
+`pg_redis_core` supports **85+ Redis commands** over both **RESP2** and **RESP3** (plus inline commands), covering Strings, Keys/Expiry, Hashes, Lists, Sorted Sets, Sets, Streams, Blocking Operations (`BZPOPMIN`, `XREAD BLOCK`), Embedded Lua 5.1 Scripting (`EVAL`/`EVALSHA`/`SCRIPT`), Transactions, and Driver Handshakes — including full **BullMQ 5.13.0 / Medusa** compatibility.
 
 ## Strings
 
@@ -30,7 +30,8 @@
 | `EXPIREAT` / `PEXPIREAT` | `EXPIREAT key unix_ts` / `PEXPIREAT key unix_ms` | Sets absolute expiration timestamp |
 | `TTL` / `PTTL` | `TTL key` / `PTTL key` | Returns remaining TTL, `-1` (no expiry), or `-2` (missing) |
 | `PERSIST` | `PERSIST key` | Removes expiration from key |
-| `TYPE` | `TYPE key` | Returns `string`, `hash`, `list`, `zset`, or `none` |
+| `TYPE` | `TYPE key` | Returns `string`, `hash`, `list`, `zset`, `set`, `stream`, or `none` |
+| `RENAME` | `RENAME key newkey` | Atomically renames key across all 6 catalog tables |
 | `KEYS` | `KEYS pattern` | Supports Redis glob patterns (`*`, `?`, `[abc]`, `[^a]`, `[a-z]`, `\x`) |
 | `SCAN` | `SCAN cursor [MATCH pattern] [COUNT count]` | Cursor-based key iteration |
 | `DBSIZE` | `DBSIZE` | Total count of active keys across all catalog tables |
@@ -63,21 +64,63 @@
 | `LINDEX` | `LINDEX key index` | Zero-based element lookup (supports negative indices) |
 | `LSET` | `LSET key index value` | Updates element at index |
 | `LREM` | `LREM key count element` | Removes matching elements from head, tail, or all |
+| `LTRIM` | `LTRIM key start stop` | Trims list to the inclusive index range |
+| `LPOS` | `LPOS key elem [RANK r] [COUNT c] [MAXLEN m]` | Finds 0-based index(es) of matching element |
+| `RPOPLPUSH` / `LMOVE` | `RPOPLPUSH src dst` / `LMOVE src dst LEFT\|RIGHT LEFT\|RIGHT` | Atomically pops from source and pushes to destination |
+| `BLPOP` / `BRPOP` | `BLPOP key [key ...] timeout` | Blocking head/tail pop woken asynchronously via `KeyNotifier` |
 
 ## Sorted Sets
 
 | Command | Syntax | Notes |
 | --- | --- | --- |
-| `ZADD` | `ZADD key [NX\|XX] [GT\|LT] [CH] [INCR] score member [...]` | Supports `+inf`/`-inf` and all modifier flags |
+| `ZADD` | `ZADD key [NX\|XX] [GT\|LT] [CH] [INCR] score member [...]` | Supports `+inf`/`-inf` and all modifier flags; wakes `BZPOPMIN`/`BZPOPMAX` |
 | `ZRANGE` | `ZRANGE key start stop [BYSCORE] [REV] [LIMIT off cnt] [WITHSCORES]` | Lexicographical tie-breaking; RESP2 flat array / RESP3 scored tuples |
 | `ZREVRANGE` | `ZREVRANGE key start stop [WITHSCORES]` | Descending score + member order |
 | `ZRANGEBYSCORE` / `ZREVRANGEBYSCORE` | `ZRANGEBYSCORE key min max [WITHSCORES] [LIMIT off cnt]` | Supports `-inf`, `+inf`, and exclusive bounds `(x` |
 | `ZREM` | `ZREM key member [member ...]` | Removes members, returns deleted count |
+| `ZREMRANGEBYRANK` / `ZREMRANGEBYSCORE` | `ZREMRANGEBYRANK key start stop` / `ZREMRANGEBYSCORE key min max` | Bulk range deletion by rank or score |
+| `ZPOPMIN` / `ZPOPMAX` | `ZPOPMIN key [count]` / `ZPOPMAX key [count]` | Atomically pops lowest/highest scored members |
+| `BZPOPMIN` / `BZPOPMAX` | `BZPOPMIN key [key ...] timeout` | Cooperative async blocking pop (supports float seconds & `0` infinite wait) |
 | `ZSCORE` | `ZSCORE key member` | Returns member score (`Double` in RESP3, `BulkString` in RESP2) |
 | `ZCARD` | `ZCARD key` | Cardinality of sorted set |
 | `ZRANK` / `ZREVRANK` | `ZRANK key member [WITHSCORE]` | 0-based ascending / descending rank |
 | `ZINCRBY` | `ZINCRBY key increment member` | Increments member score (inserts if absent) |
 | `ZCOUNT` | `ZCOUNT key min max` | Count of members within inclusive/exclusive score bounds |
+
+## Sets
+
+| Command | Syntax | Notes |
+| --- | --- | --- |
+| `SADD` | `SADD key member [member ...]` | Inserts unique set members into `pg_redis_sets` |
+| `SREM` | `SREM key member [member ...]` | Removes members, returns deleted count |
+| `SMEMBERS` | `SMEMBERS key` | Returns all members in set |
+| `SISMEMBER` | `SISMEMBER key member` | Returns `1` if member exists, else `0` |
+| `SCARD` | `SCARD key` | Cardinality of set |
+| `SPOP` | `SPOP key [count]` | Atomically removes and returns member(s) |
+
+## Streams
+
+| Command | Syntax | Notes |
+| --- | --- | --- |
+| `XADD` | `XADD key [NOMKSTREAM] [MAXLEN\|MINID [=\|~] n [LIMIT m]] (*\|id) field val [...]` | Monotonic `<ms>-<seq>` IDs, approximate/exact trim, wakes `XREAD BLOCK` |
+| `XTRIM` | `XTRIM key MAXLEN\|MINID [=\|~] threshold [LIMIT count]` | Trims oldest stream entries |
+| `XREAD` | `XREAD [COUNT n] [BLOCK ms] STREAMS key [...] id [...]` | Supports `$`, `0-0`, explicit IDs, and cooperative async `BLOCK` |
+| `XRANGE` / `XREVRANGE` | `XRANGE key start end [COUNT n]` | Range queries with `-`, `+`, and exclusive `(id` bounds |
+| `XLEN` | `XLEN key` | Total number of entries in stream |
+| `XDEL` | `XDEL key id [id ...]` | Deletes stream entries by ID |
+
+## Lua 5.1 Scripting
+
+| Command | Syntax | Notes |
+| --- | --- | --- |
+| `EVAL` / `EVAL_RO` | `EVAL script numkeys [key ...] [arg ...]` | Executes Lua 5.1 script atomically inside a single PostgreSQL SPI transaction |
+| `EVALSHA` / `EVALSHA_RO` | `EVALSHA sha1 numkeys [key ...] [arg ...]` | Runs cached compiled Lua bytecode chunk (`NOSCRIPT` on cache miss) |
+| `SCRIPT LOAD` | `SCRIPT LOAD script` | Compiles and caches script by 40-char lowercase SHA1 hex digest |
+| `SCRIPT EXISTS` | `SCRIPT EXISTS sha1 [sha1 ...]` | Checks which SHA1 digests are cached |
+| `SCRIPT FLUSH` | `SCRIPT FLUSH` | Clears the compiled Lua script cache |
+
+!!! info "Included Lua 5.1 Builtins (Exact Redis Sandbox Parity)"
+    Powered by vendored **Lua 5.1 (`mlua`)** inside the background worker with `KEYS`, `ARGV` (binary-safe), `redis.call`, `redis.pcall`, `redis.status_reply`, `redis.error_reply`, `redis.sha1hex`, `redis.log`, **`cjson`**, **`cmsgpack`**, and **`bit`**.
 
 ## Transactions & Server / Protocol
 

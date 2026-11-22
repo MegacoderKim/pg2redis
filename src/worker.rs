@@ -11,8 +11,13 @@ use tokio::sync::watch;
 use tokio::task::LocalSet;
 
 use crate::cache::L1Cache;
-use crate::commands::{execute_batch_in_worker, ConnectionState};
+use crate::commands::{
+    execute_batch_in_worker, lists, parse_blocking_command, streams, zsets, BlockingCommand,
+    ConnectionState,
+};
 use crate::config;
+use crate::lua::LuaEngine;
+use crate::notify::KeyNotifier;
 use crate::protocol::{decode_command, encode_resp, RespValue};
 use crate::storage::{self, PreparedPlans};
 
@@ -124,16 +129,29 @@ pub extern "C" fn pg_redis_bgworker_main(_arg: pg_sys::Datum) {
         }
     };
 
+    // Initialize embedded Lua 5.1 VM (mlua vendored) with cjson, cmsgpack, bit, and SHA1 script cache
+    let lua_engine: Rc<Option<LuaEngine>> = match LuaEngine::new() {
+        Ok(engine) => {
+            pgrx::log!("pg_redis_core: embedded Lua 5.1 scripting engine initialized");
+            Rc::new(Some(engine))
+        }
+        Err(e) => {
+            pgrx::warning!("pg_redis_core: failed to initialize Lua 5.1 engine: {}", e);
+            Rc::new(None)
+        }
+    };
+
     if should_shutdown() {
         pgrx::log!("pg_redis_core: SIGTERM received before starting Tokio runtime, exiting");
         return;
     }
 
     let cache = Rc::new(L1Cache::new(config::cache_capacity()));
+    let notifier = Rc::new(KeyNotifier::new());
 
-    // IMPORTANT: PostgreSQL SPI is strictly single-threaded per backend process.
-    // We use Tokio's `current_thread` runtime + `LocalSet` so all async network I/O
-    // and SPI transactions execute exclusively on this background worker OS thread.
+    // PostgreSQL SPI is strictly single-threaded per backend process.
+    // Tokio `current_thread` + `LocalSet` multiplexes all async TCP connections and
+    // blocking command waits (`BZPOPMIN`, `XREAD BLOCK`) on this single OS thread.
     let runtime = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -211,9 +229,18 @@ pub extern "C" fn pg_redis_bgworker_main(_arg: pg_sys::Datum) {
                             let _ = stream.set_nodelay(true);
                             let client_plans = Rc::clone(&plans);
                             let client_cache = Rc::clone(&cache);
+                            let client_lua = Rc::clone(&lua_engine);
+                            let client_notifier = Rc::clone(&notifier);
                             let client_shutdown = shutdown_rx.clone();
                             tokio::task::spawn_local(async move {
-                                handle_connection(stream, client_plans, client_cache, client_shutdown).await;
+                                handle_connection(
+                                    stream,
+                                    client_plans,
+                                    client_cache,
+                                    client_lua,
+                                    client_notifier,
+                                    client_shutdown,
+                                ).await;
                             });
                         }
                         Err(e) => {
@@ -258,6 +285,8 @@ async fn handle_connection(
     mut stream: TcpStream,
     plans: Rc<Option<PreparedPlans>>,
     cache: Rc<L1Cache>,
+    lua: Rc<Option<LuaEngine>>,
+    notifier: Rc<KeyNotifier>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) {
     let client_id = NEXT_CLIENT_ID.fetch_add(1, Ordering::Relaxed);
@@ -275,7 +304,7 @@ async fn handle_connection(
             }
             res = stream.read_buf(&mut read_buf) => {
                 match res {
-                    Ok(0) => break, // EOF
+                    Ok(0) => break,
                     Ok(n) => n,
                     Err(_) => break,
                 }
@@ -287,12 +316,12 @@ async fn handle_connection(
         }
 
         // Parse ALL complete RESP frames currently buffered (pipelining & batching, RFC §5.4)
-        let mut batch: Vec<Vec<Bytes>> = Vec::new();
+        let mut decoded: Vec<Vec<Bytes>> = Vec::new();
         let mut protocol_err: Option<String> = None;
 
         loop {
             match decode_command(&mut read_buf) {
-                Ok(Some(cmd_args)) => batch.push(cmd_args),
+                Ok(Some(cmd_args)) => decoded.push(cmd_args),
                 Ok(None) => break,
                 Err(e) => {
                     protocol_err = Some(e.to_string());
@@ -301,11 +330,70 @@ async fn handle_connection(
             }
         }
 
-        if !batch.is_empty() {
+        let mut pending_batch: Vec<Vec<Bytes>> = Vec::new();
+        let mut write_failed = false;
+
+        for cmd_args in decoded {
+            if let Some(blocking_parsed) = parse_blocking_command(&cmd_args, conn.in_multi) {
+                // Flush any preceding non-blocking commands first
+                if !pending_batch.is_empty() {
+                    let batch = std::mem::take(&mut pending_batch);
+                    let responses = execute_batch_in_worker(
+                        batch,
+                        plans.as_ref().as_ref(),
+                        Some(cache.as_ref()),
+                        lua.as_ref().as_ref(),
+                        Some(notifier.as_ref()),
+                        &mut conn,
+                    );
+                    write_buf.clear();
+                    for (resp, proto) in &responses {
+                        encode_resp(resp, *proto, &mut write_buf);
+                    }
+                    if !write_buf.is_empty() && stream.write_all(&write_buf).await.is_err() {
+                        write_failed = true;
+                        break;
+                    }
+                    if conn.should_quit {
+                        break;
+                    }
+                }
+
+                let resp = match blocking_parsed {
+                    Err(err_resp) => err_resp,
+                    Ok(bcmd) => {
+                        execute_blocking_command(
+                            bcmd,
+                            &stream,
+                            &notifier,
+                            &mut shutdown_rx,
+                        )
+                        .await
+                    }
+                };
+
+                write_buf.clear();
+                encode_resp(&resp, conn.protocol, &mut write_buf);
+                if !write_buf.is_empty() && stream.write_all(&write_buf).await.is_err() {
+                    write_failed = true;
+                    break;
+                }
+            } else {
+                pending_batch.push(cmd_args);
+            }
+        }
+
+        if write_failed {
+            break;
+        }
+
+        if !pending_batch.is_empty() {
             let responses = execute_batch_in_worker(
-                batch,
+                pending_batch,
                 plans.as_ref().as_ref(),
                 Some(cache.as_ref()),
+                lua.as_ref().as_ref(),
+                Some(notifier.as_ref()),
                 &mut conn,
             );
 
@@ -330,4 +418,187 @@ async fn handle_connection(
             break;
         }
     }
+}
+
+async fn execute_blocking_command(
+    cmd: BlockingCommand,
+    stream: &TcpStream,
+    notifier: &KeyNotifier,
+    shutdown_rx: &mut watch::Receiver<bool>,
+) -> RespValue {
+    match cmd {
+        BlockingCommand::BZPop {
+            keys,
+            timeout_secs,
+            is_max,
+        } => {
+            let deadline = if timeout_secs == 0.0 {
+                None
+            } else {
+                Some(tokio::time::Instant::now() + Duration::from_secs_f64(timeout_secs))
+            };
+            wait_for_keys(&keys, deadline, stream, notifier, shutdown_rx, || {
+                let keys_guard = AssertUnwindSafe(&keys);
+                BackgroundWorker::transaction(move || {
+                    Spi::connect(|mut client| {
+                        zsets::try_bzpop_once(&mut client, *keys_guard, is_max).unwrap_or(None)
+                    })
+                })
+            })
+            .await
+        }
+        BlockingCommand::BLPop {
+            keys,
+            timeout_secs,
+            is_right,
+        } => {
+            let deadline = if timeout_secs == 0.0 {
+                None
+            } else {
+                Some(tokio::time::Instant::now() + Duration::from_secs_f64(timeout_secs))
+            };
+            wait_for_keys(&keys, deadline, stream, notifier, shutdown_rx, || {
+                let keys_guard = AssertUnwindSafe(&keys);
+                BackgroundWorker::transaction(move || {
+                    Spi::connect(|mut client| {
+                        lists::try_blpop_once(&mut client, *keys_guard, is_right).unwrap_or(None)
+                    })
+                })
+            })
+            .await
+        }
+        BlockingCommand::XReadBlock { req } => {
+            // Resolve `$` IDs once before blocking so entries added after XREAD starts are captured
+            let resolved_res: Result<Vec<(String, i64, i64)>, RespValue> = {
+                let req_guard = AssertUnwindSafe(&req.streams);
+                BackgroundWorker::transaction(move || {
+                    Spi::connect(|client| {
+                        streams::resolve_xread_ids(&client, *req_guard)
+                            .unwrap_or_else(|e| Err(RespValue::err(format!("ERR SPI error: {e}"))))
+                    })
+                })
+            };
+
+            let resolved = match resolved_res {
+                Ok(r) => r,
+                Err(e) => return e,
+            };
+
+            let block_ms = req.block_ms.unwrap_or(0);
+            let deadline = if block_ms == 0 {
+                None
+            } else {
+                Some(tokio::time::Instant::now() + Duration::from_millis(block_ms))
+            };
+
+            let keys: Vec<String> = resolved.iter().map(|(k, _, _)| k.clone()).collect();
+            let count = req.count;
+
+            wait_for_keys(&keys, deadline, stream, notifier, shutdown_rx, || {
+                let res_guard = AssertUnwindSafe(&resolved);
+                BackgroundWorker::transaction(move || {
+                    Spi::connect(|client| {
+                        streams::execute_xread_resolved(&client, *res_guard, count).unwrap_or(None)
+                    })
+                })
+            })
+            .await
+        }
+    }
+}
+
+async fn wait_for_keys<F>(
+    keys: &[String],
+    deadline: Option<tokio::time::Instant>,
+    stream: &TcpStream,
+    notifier: &KeyNotifier,
+    shutdown_rx: &mut watch::Receiver<bool>,
+    mut try_once: F,
+) -> RespValue
+where
+    F: FnMut() -> Option<RespValue>,
+{
+    // Fast path: check immediately before registering waiters
+    if let Some(val) = try_once() {
+        return val;
+    }
+
+    let handles = notifier.get_notifiers(keys);
+
+    let result = loop {
+        // Check deadline
+        let now = tokio::time::Instant::now();
+        let poll_wait = match deadline {
+            Some(dl) if now >= dl => break RespValue::Null,
+            Some(dl) => (dl - now).min(Duration::from_millis(250)),
+            None => Duration::from_millis(250),
+        };
+
+        // Register future BEFORE re-checking to avoid lost wakeups
+        let first_notify = handles.first().cloned();
+
+        // Check once more right after registering
+        if let Some(val) = try_once() {
+            break val;
+        }
+
+        // Wait on notification, timer slice, shutdown, or client disconnect (EOF)
+        let wait_fut = async {
+            if handles.len() == 1 {
+                if let Some(ref n) = first_notify {
+                    n.notified().await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            } else if !handles.is_empty() {
+                // Race all key notifiers
+                let mut futs = Vec::with_capacity(handles.len());
+                for h in &handles {
+                    futs.push(Box::pin(h.notified()));
+                }
+                let _ = wait_any_pinned(futs).await;
+            } else {
+                std::future::pending::<()>().await;
+            }
+        };
+
+        let mut peek_buf = [0u8; 1];
+        tokio::select! {
+            _ = shutdown_rx.changed() => {
+                if *shutdown_rx.borrow() {
+                    break RespValue::Null;
+                }
+            }
+            _ = wait_fut => {}
+            _ = tokio::time::sleep(poll_wait) => {}
+            peek_res = stream.peek(&mut peek_buf) => {
+                match peek_res {
+                    Ok(0) | Err(_) => break RespValue::Null,
+                    Ok(_) => {}
+                }
+            }
+        }
+
+        if let Some(val) = try_once() {
+            break val;
+        }
+    };
+
+    drop(handles);
+    notifier.gc_keys(keys);
+    result
+}
+
+async fn wait_any_pinned<F: std::future::Future>(
+    mut futs: Vec<std::pin::Pin<Box<F>>>,
+) -> usize {
+    std::future::poll_fn(|cx| {
+        for (idx, fut) in futs.iter_mut().enumerate() {
+            if fut.as_mut().poll(cx).is_ready() {
+                return std::task::Poll::Ready(idx);
+            }
+        }
+        std::task::Poll::Pending
+    })
+    .await
 }

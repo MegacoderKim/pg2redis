@@ -101,7 +101,9 @@ pub fn tables_exist(client: &SpiClient) -> SpiResult<bool> {
             "SELECT to_regclass('pg_redis_strings') IS NOT NULL \
              AND to_regclass('pg_redis_hashes') IS NOT NULL \
              AND to_regclass('pg_redis_lists') IS NOT NULL \
-             AND to_regclass('pg_redis_zsets') IS NOT NULL",
+             AND to_regclass('pg_redis_zsets') IS NOT NULL \
+             AND to_regclass('pg_redis_sets') IS NOT NULL \
+             AND to_regclass('pg_redis_streams') IS NOT NULL",
             None,
             None,
         )?
@@ -150,6 +152,24 @@ pub fn ensure_schema(client: &mut SpiClient, unlogged: bool) -> SpiResult<()> {
         ) WITH (fillfactor = 80);
         CREATE INDEX IF NOT EXISTS idx_redis_zsets_score
             ON pg_redis_zsets(key, score);
+
+        CREATE {table_kw} IF NOT EXISTS pg_redis_sets (
+            key TEXT,
+            member TEXT,
+            PRIMARY KEY (key, member)
+        ) WITH (fillfactor = 80);
+        CREATE INDEX IF NOT EXISTS idx_redis_sets_key
+            ON pg_redis_sets(key);
+
+        CREATE {table_kw} IF NOT EXISTS pg_redis_streams (
+            key TEXT,
+            ms BIGINT,
+            seq BIGINT,
+            fields TEXT,
+            PRIMARY KEY (key, ms, seq)
+        ) WITH (fillfactor = 80);
+        CREATE INDEX IF NOT EXISTS idx_redis_streams_key_id
+            ON pg_redis_streams(key, ms, seq);
         "#
     );
 
@@ -164,6 +184,8 @@ pub fn set_tables_unlogged(client: &mut SpiClient, unlogged: bool) -> SpiResult<
         "pg_redis_hashes",
         "pg_redis_lists",
         "pg_redis_zsets",
+        "pg_redis_sets",
+        "pg_redis_streams",
     ] {
         let sql = format!("ALTER TABLE {tbl} SET {mode}");
         client.update(&sql, None, None)?;

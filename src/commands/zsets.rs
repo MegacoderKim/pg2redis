@@ -77,6 +77,7 @@ pub fn cmd_zadd(
     client: &mut SpiClient,
     plans: Option<&PreparedPlans>,
     args: &[Bytes],
+    mutated_keys: &mut Vec<String>,
 ) -> SpiResult<RespValue> {
     if args.len() < 4 {
         return Ok(RespValue::wrong_arity("zadd"));
@@ -178,6 +179,7 @@ pub fn cmd_zadd(
                 added_count += 1;
                 changed_count += 1;
                 if incr {
+                    mutated_keys.push(key);
                     return Ok(RespValue::Double(score_arg));
                 }
             }
@@ -227,10 +229,15 @@ pub fn cmd_zadd(
                 }
 
                 if incr {
+                    mutated_keys.push(key);
                     return Ok(RespValue::Double(new_score));
                 }
             }
         }
+    }
+
+    if changed_count > 0 || added_count > 0 {
+        mutated_keys.push(key);
     }
 
     Ok(RespValue::Integer(if ch {
@@ -384,6 +391,7 @@ pub fn cmd_zincrby(
     client: &mut SpiClient,
     plans: Option<&PreparedPlans>,
     args: &[Bytes],
+    mutated_keys: &mut Vec<String>,
 ) -> SpiResult<RespValue> {
     if args.len() != 4 {
         return Ok(RespValue::wrong_arity("zincrby"));
@@ -405,12 +413,13 @@ pub fn cmd_zincrby(
          ON CONFLICT (key, member) DO UPDATE SET score = EXCLUDED.score",
         None,
         Some(vec![
-            (PgBuiltInOids::TEXTOID.oid(), key.into_datum()),
+            (PgBuiltInOids::TEXTOID.oid(), key.clone().into_datum()),
             (PgBuiltInOids::TEXTOID.oid(), member.into_datum()),
             (PgBuiltInOids::FLOAT8OID.oid(), next.into_datum()),
         ]),
     )?;
 
+    mutated_keys.push(key);
     Ok(RespValue::Double(next))
 }
 
@@ -708,4 +717,224 @@ fn format_zset_rows(
 #[allow(dead_code)]
 fn _keep_format_score_used() -> String {
     format_score(0.0)
+}
+
+/// `ZPOPMIN key [count]` / `ZPOPMAX key [count]`
+pub fn cmd_zpop(client: &mut SpiClient, args: &[Bytes], is_max: bool) -> SpiResult<RespValue> {
+    let name = if is_max { "zpopmax" } else { "zpopmin" };
+    if args.len() < 2 || args.len() > 3 {
+        return Ok(RespValue::wrong_arity(name));
+    }
+    let key = as_str(&args[1]);
+    let count = if args.len() == 3 {
+        let Some(c) = parse_i64(&args[2]) else {
+            return Ok(RespValue::not_integer_err());
+        };
+        if c < 0 {
+            return Ok(RespValue::err("ERR value is out of range, must be positive"));
+        }
+        c
+    } else {
+        1
+    };
+
+    if count == 0 {
+        return Ok(RespValue::ScoredArray(Vec::new()));
+    }
+
+    let order = if is_max {
+        "score DESC, member DESC"
+    } else {
+        "score ASC, member ASC"
+    };
+
+    let sql = format!(
+        "WITH popped AS ( \
+            SELECT key, member, score FROM pg_redis_zsets \
+            WHERE key = $1 ORDER BY {order} LIMIT $2 \
+        ) \
+        DELETE FROM pg_redis_zsets z USING popped p \
+        WHERE z.key = p.key AND z.member = p.member \
+        RETURNING z.member, z.score"
+    );
+
+    let table = client.update(
+        &sql,
+        None,
+        Some(vec![
+            (PgBuiltInOids::TEXTOID.oid(), key.into_datum()),
+            (PgBuiltInOids::INT8OID.oid(), count.into_datum()),
+        ]),
+    )?;
+
+    let mut pairs: Vec<(Bytes, f64)> = Vec::with_capacity(table.len());
+    for row in table {
+        let member: String = row.get(1)?.unwrap_or_default();
+        let score: f64 = row.get(2)?.unwrap_or(0.0);
+        pairs.push((Bytes::from(member), score));
+    }
+
+    if is_max {
+        pairs.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| b.0.cmp(&a.0))
+        });
+    } else {
+        pairs.sort_by(|a, b| {
+            a.1.partial_cmp(&b.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.0.cmp(&b.0))
+        });
+    }
+
+    Ok(RespValue::ScoredArray(pairs))
+}
+
+/// Non-blocking single pop across multiple keys used by `BZPOPMIN` / `BZPOPMAX`.
+/// Returns `Ok(Some([key, member, score]))` on hit, or `Ok(None)` if all keys are empty.
+pub fn try_bzpop_once(
+    client: &mut SpiClient,
+    keys: &[String],
+    is_max: bool,
+) -> SpiResult<Option<RespValue>> {
+    let order = if is_max {
+        "score DESC, member DESC"
+    } else {
+        "score ASC, member ASC"
+    };
+
+    let sql = format!(
+        "WITH popped AS ( \
+            SELECT key, member, score FROM pg_redis_zsets \
+            WHERE key = $1 ORDER BY {order} LIMIT 1 \
+        ) \
+        DELETE FROM pg_redis_zsets z USING popped p \
+        WHERE z.key = p.key AND z.member = p.member \
+        RETURNING z.member, z.score"
+    );
+
+    for key in keys {
+        let table = client.update(
+            &sql,
+            None,
+            Some(vec![(PgBuiltInOids::TEXTOID.oid(), key.clone().into_datum())]),
+        )?;
+        if !table.is_empty() {
+            let row = table.first();
+            let member: String = row.get(1)?.unwrap_or_default();
+            let score: f64 = row.get(2)?.unwrap_or(0.0);
+            return Ok(Some(RespValue::Array(vec![
+                RespValue::bulk(key.clone()),
+                RespValue::bulk(member),
+                RespValue::Double(score),
+            ])));
+        }
+    }
+
+    Ok(None)
+}
+
+/// `ZREMRANGEBYRANK key start stop`
+pub fn cmd_zremrangebyrank(client: &mut SpiClient, args: &[Bytes]) -> SpiResult<RespValue> {
+    if args.len() != 4 {
+        return Ok(RespValue::wrong_arity("zremrangebyrank"));
+    }
+    let key = as_str(&args[1]);
+    let Some(mut start) = parse_i64(&args[2]) else {
+        return Ok(RespValue::not_integer_err());
+    };
+    let Some(mut stop) = parse_i64(&args[3]) else {
+        return Ok(RespValue::not_integer_err());
+    };
+
+    let len = client
+        .select(
+            "SELECT COUNT(*)::BIGINT FROM pg_redis_zsets WHERE key = $1",
+            None,
+            Some(vec![(PgBuiltInOids::TEXTOID.oid(), key.clone().into_datum())]),
+        )?
+        .first()
+        .get_one::<i64>()?
+        .unwrap_or(0);
+
+    if len == 0 {
+        return Ok(RespValue::Integer(0));
+    }
+
+    if start < 0 {
+        start = (len + start).max(0);
+    }
+    if stop < 0 {
+        stop += len;
+    }
+    if start > stop || start >= len || stop < 0 {
+        return Ok(RespValue::Integer(0));
+    }
+    if stop >= len {
+        stop = len - 1;
+    }
+
+    let count = stop - start + 1;
+    let res = client.update(
+        "WITH target AS ( \
+            SELECT key, member FROM pg_redis_zsets \
+            WHERE key = $1 ORDER BY score ASC, member ASC \
+            OFFSET $2 LIMIT $3 \
+        ) \
+        DELETE FROM pg_redis_zsets z USING target t \
+        WHERE z.key = t.key AND z.member = t.member",
+        None,
+        Some(vec![
+            (PgBuiltInOids::TEXTOID.oid(), key.into_datum()),
+            (PgBuiltInOids::INT8OID.oid(), start.into_datum()),
+            (PgBuiltInOids::INT8OID.oid(), count.into_datum()),
+        ]),
+    )?;
+
+    Ok(RespValue::Integer(res.len() as i64))
+}
+
+/// `ZREMRANGEBYSCORE key min max`
+pub fn cmd_zremrangebyscore(client: &mut SpiClient, args: &[Bytes]) -> SpiResult<RespValue> {
+    if args.len() != 4 {
+        return Ok(RespValue::wrong_arity("zremrangebyscore"));
+    }
+    let key = as_str(&args[1]);
+    let Some(min_bound) = parse_score_bound(&args[2]) else {
+        return Ok(RespValue::err("ERR min or max is not a float"));
+    };
+    let Some(max_bound) = parse_score_bound(&args[3]) else {
+        return Ok(RespValue::err("ERR min or max is not a float"));
+    };
+
+    let table = client.select(
+        "SELECT member, score FROM pg_redis_zsets WHERE key = $1",
+        None,
+        Some(vec![(PgBuiltInOids::TEXTOID.oid(), key.clone().into_datum())]),
+    )?;
+
+    let mut to_remove = Vec::new();
+    for row in table {
+        let member: String = row.get(1)?.unwrap_or_default();
+        let score: f64 = row.get(2)?.unwrap_or(0.0);
+        if score_matches_bounds(score, min_bound, max_bound) {
+            to_remove.push(member);
+        }
+    }
+
+    let mut removed: i64 = 0;
+    for member in to_remove {
+        let res = client.update(
+            "DELETE FROM pg_redis_zsets WHERE key = $1 AND member = $2",
+            None,
+            Some(vec![
+                (PgBuiltInOids::TEXTOID.oid(), key.clone().into_datum()),
+                (PgBuiltInOids::TEXTOID.oid(), member.into_datum()),
+            ]),
+        )?;
+        removed += res.len() as i64;
+    }
+
+    Ok(RespValue::Integer(removed))
 }

@@ -1,10 +1,49 @@
-# Client Examples (Python, Kotlin & Go)
+# Client Examples (Python, Kotlin, Go & BullMQ / Medusa)
 
-`pg_redis_core` works out of the box with standard Redis drivers — no custom SDKs or PostgreSQL-specific client code required.
+`pg_redis_core` works out of the box with standard Redis drivers and job-queue frameworks (including **BullMQ 5.13.0** for **Medusa**) — no custom SDKs or PostgreSQL-specific client code required.
 
-All three runnable Dockerized suites live under [`tests/clients/`](https://github.com/MegacoderKim/pg2redis/tree/main/tests/clients).
+All runnable Dockerized suites live under [`tests/clients/`](https://github.com/MegacoderKim/pg2redis/tree/main/tests/clients).
 
 ## Multi-Language Quick Reference
+
+=== "Node.js (BullMQ 5.13.0 / Medusa)"
+
+    ```javascript title="tests/clients/bullmq/test_bullmq.mjs"
+    import { Queue, Worker, QueueEvents } from "bullmq";
+
+    const connection = {
+      host: process.env.REDIS_HOST || "localhost",
+      port: Number(process.env.REDIS_PORT || "6379"),
+      maxRetriesPerRequest: null,
+    };
+
+    const queue = new Queue("medusa-events", { connection });
+    const queueEvents = new QueueEvents("medusa-events", { connection });
+
+    // Idle worker blocks cooperatively on BZPOPMIN; wakes instantly when Lua enqueues jobs
+    const worker = new Worker(
+      "medusa-events",
+      async (job) => {
+        console.log(`Processing ${job.name}:`, job.data);
+        return { delivered: true };
+      },
+      { connection }
+    );
+
+    // Enqueues via BullMQ's Lua 5.1 scripts (cmsgpack + cjson + XADD + ZADD)
+    const job = await queue.add("order.placed", {
+      orderId: "order_01J9XYZ",
+      email: "buyer@example.com",
+    });
+
+    const result = await job.waitUntilFinished(queueEvents, 10000);
+    console.log("Completed:", result);
+    ```
+
+    **Run with Docker Compose:**
+    ```bash
+    docker compose --profile test run --rm --build test-bullmq
+    ```
 
 === "Python (FastAPI + redis-py)"
 

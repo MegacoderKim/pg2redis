@@ -2,14 +2,19 @@ pub mod hashes;
 pub mod keys;
 pub mod lists;
 pub mod server;
+pub mod sets;
+pub mod streams;
 pub mod strings;
 pub mod zsets;
 
 use bytes::Bytes;
 use pgrx::bgworkers::BackgroundWorker;
 use pgrx::spi::{Spi, SpiClient, SpiResult};
+use std::panic::AssertUnwindSafe;
 
 use crate::cache::L1Cache;
+use crate::lua::LuaEngine;
+use crate::notify::KeyNotifier;
 use crate::protocol::{RespValue, RespVersion};
 use crate::storage::PreparedPlans;
 
@@ -37,19 +42,98 @@ impl ConnectionState {
     }
 }
 
-fn cmd_name_upper(args: &[Bytes]) -> String {
+/// Asynchronous blocking commands handled cooperatively on the Tokio `LocalSet`.
+#[derive(Debug, Clone)]
+pub enum BlockingCommand {
+    BZPop {
+        keys: Vec<String>,
+        timeout_secs: f64,
+        is_max: bool,
+    },
+    BLPop {
+        keys: Vec<String>,
+        timeout_secs: f64,
+        is_right: bool,
+    },
+    XReadBlock {
+        req: streams::XReadRequest,
+    },
+}
+
+pub fn cmd_name_upper(args: &[Bytes]) -> String {
     args.first()
         .map(|b| String::from_utf8_lossy(b).to_ascii_uppercase())
         .unwrap_or_default()
 }
 
+/// Detect whether `args` is a blocking command (`BZPOPMIN`, `BZPOPMAX`, `BLPOP`, `BRPOP`,
+/// or `XREAD ... BLOCK ...`) when not inside `MULTI`.
+pub fn parse_blocking_command(
+    args: &[Bytes],
+    in_multi: bool,
+) -> Option<Result<BlockingCommand, RespValue>> {
+    if in_multi || args.is_empty() {
+        return None;
+    }
+    let cmd = cmd_name_upper(args);
+    match cmd.as_str() {
+        "BZPOPMIN" | "BZPOPMAX" => {
+            if args.len() < 3 {
+                return Some(Err(RespValue::wrong_arity(&cmd)));
+            }
+            let timeout_str = std::str::from_utf8(&args[args.len() - 1]).unwrap_or("");
+            let Ok(timeout_secs) = timeout_str.parse::<f64>() else {
+                return Some(Err(RespValue::err("ERR timeout is not a float or out of range")));
+            };
+            if timeout_secs.is_nan() || timeout_secs < 0.0 {
+                return Some(Err(RespValue::err("ERR timeout is negative")));
+            }
+            let keys: Vec<String> = args[1..args.len() - 1]
+                .iter()
+                .map(|b| String::from_utf8_lossy(b).into_owned())
+                .collect();
+            Some(Ok(BlockingCommand::BZPop {
+                keys,
+                timeout_secs,
+                is_max: cmd == "BZPOPMAX",
+            }))
+        }
+        "BLPOP" | "BRPOP" => {
+            if args.len() < 3 {
+                return Some(Err(RespValue::wrong_arity(&cmd)));
+            }
+            let timeout_str = std::str::from_utf8(&args[args.len() - 1]).unwrap_or("");
+            let Ok(timeout_secs) = timeout_str.parse::<f64>() else {
+                return Some(Err(RespValue::err("ERR timeout is not a float or out of range")));
+            };
+            if timeout_secs.is_nan() || timeout_secs < 0.0 {
+                return Some(Err(RespValue::err("ERR timeout is negative")));
+            }
+            let keys: Vec<String> = args[1..args.len() - 1]
+                .iter()
+                .map(|b| String::from_utf8_lossy(b).into_owned())
+                .collect();
+            Some(Ok(BlockingCommand::BLPop {
+                keys,
+                timeout_secs,
+                is_right: cmd == "BRPOP",
+            }))
+        }
+        "XREAD" => match streams::parse_xread_args(args) {
+            Ok(req) if req.block_ms.is_some() => Some(Ok(BlockingCommand::XReadBlock { req })),
+            Ok(_) => None,
+            Err(e) => Some(Err(e)),
+        },
+        _ => None,
+    }
+}
+
 /// Try to handle a command purely in memory without opening a PostgreSQL SPI transaction.
-/// Returns `Some(RespValue)` if satisfied in memory (server command, MULTI queue, or L1 cache hit),
-/// or `None` if PostgreSQL SPI execution is required.
 fn try_execute_in_memory(
     args: &[Bytes],
     conn: &mut ConnectionState,
     cache: Option<&L1Cache>,
+    lua: Option<&LuaEngine>,
 ) -> Option<RespValue> {
     let cmd = cmd_name_upper(args);
 
@@ -61,7 +145,7 @@ fn try_execute_in_memory(
                 conn.multi_queue.clear();
                 Some(RespValue::ok())
             }
-            "EXEC" => None, // Needs SPI transaction to execute queued commands atomically
+            "EXEC" => None,
             _ => {
                 conn.multi_queue.push(args.to_vec());
                 Some(RespValue::queued())
@@ -81,6 +165,7 @@ fn try_execute_in_memory(
         "CONFIG" => Some(server::cmd_config(args)),
         "TIME" => Some(server::cmd_time()),
         "AUTH" => Some(RespValue::ok()),
+        "SCRIPT" => Some(handle_script_cmd(lua, args)),
         "MULTI" => {
             conn.in_multi = true;
             conn.multi_queue.clear();
@@ -97,13 +182,111 @@ fn try_execute_in_memory(
     }
 }
 
+fn handle_script_cmd(lua: Option<&LuaEngine>, args: &[Bytes]) -> RespValue {
+    if args.len() < 2 {
+        return RespValue::wrong_arity("script");
+    }
+    let Some(engine) = lua else {
+        return RespValue::err("ERR Lua engine is unavailable in this session");
+    };
+    let sub = String::from_utf8_lossy(&args[1]).to_ascii_uppercase();
+    match sub.as_str() {
+        "LOAD" => {
+            if args.len() != 3 {
+                return RespValue::wrong_arity("script|load");
+            }
+            match engine.script_load(args[2].as_ref()) {
+                Ok(sha) => RespValue::bulk(sha),
+                Err(e) => RespValue::err(e),
+            }
+        }
+        "EXISTS" => {
+            if args.len() < 3 {
+                return RespValue::wrong_arity("script|exists");
+            }
+            let shas: Vec<String> = args[2..]
+                .iter()
+                .map(|b| String::from_utf8_lossy(b).into_owned())
+                .collect();
+            let flags = engine.script_exists(&shas);
+            RespValue::Array(flags.into_iter().map(RespValue::Integer).collect())
+        }
+        "FLUSH" => {
+            engine.script_flush();
+            RespValue::ok()
+        }
+        _ => RespValue::err(format!(
+            "ERR Unknown SCRIPT subcommand or wrong number of arguments for '{sub}'"
+        )),
+    }
+}
+
+fn handle_eval_cmd(
+    is_sha: bool,
+    client: &mut SpiClient,
+    plans: Option<&PreparedPlans>,
+    cache: Option<&L1Cache>,
+    lua: Option<&LuaEngine>,
+    conn: &mut ConnectionState,
+    args: &[Bytes],
+    mutated_keys: &mut Vec<String>,
+) -> RespValue {
+    let name = if is_sha { "evalsha" } else { "eval" };
+    if args.len() < 3 {
+        return RespValue::wrong_arity(name);
+    }
+    let Some(engine) = lua else {
+        return RespValue::err("ERR Lua engine is unavailable in this session");
+    };
+    let Ok(numkeys) = std::str::from_utf8(&args[2]).unwrap_or("").parse::<i64>() else {
+        return RespValue::not_integer_err();
+    };
+    if numkeys < 0 {
+        return RespValue::err("ERR Number of keys can't be negative");
+    }
+    let numkeys_usize = numkeys as usize;
+    if 3 + numkeys_usize > args.len() {
+        return RespValue::err("ERR Number of keys can't be greater than number of args");
+    }
+
+    let keys = &args[3..3 + numkeys_usize];
+    let argv = &args[3 + numkeys_usize..];
+
+    if is_sha {
+        let sha = String::from_utf8_lossy(&args[1]);
+        engine.evalsha(
+            &sha,
+            keys,
+            argv,
+            client,
+            plans,
+            cache,
+            conn,
+            mutated_keys,
+        )
+    } else {
+        engine.eval(
+            args[1].as_ref(),
+            keys,
+            argv,
+            client,
+            plans,
+            cache,
+            conn,
+            mutated_keys,
+        )
+    }
+}
+
 /// Execute a single command inside an active PostgreSQL SPI connection.
 pub fn dispatch_with_spi(
     client: &mut SpiClient,
     plans: Option<&PreparedPlans>,
     cache: Option<&L1Cache>,
+    lua: Option<&LuaEngine>,
     conn: &mut ConnectionState,
     args: &[Bytes],
+    mutated_keys: &mut Vec<String>,
 ) -> SpiResult<RespValue> {
     if args.is_empty() {
         return Ok(RespValue::err("ERR empty command"));
@@ -111,7 +294,6 @@ pub fn dispatch_with_spi(
 
     let cmd = cmd_name_upper(args);
 
-    // Handle MULTI/EXEC/DISCARD inside SPI batch too
     if conn.in_multi {
         match cmd.as_str() {
             "MULTI" => return Ok(RespValue::err("ERR MULTI calls can not be nested")),
@@ -125,7 +307,15 @@ pub fn dispatch_with_spi(
                 let queued = std::mem::take(&mut conn.multi_queue);
                 let mut results = Vec::with_capacity(queued.len());
                 for q_args in &queued {
-                    let res = dispatch_single_non_multi(client, plans, cache, conn, q_args)?;
+                    let res = dispatch_single_non_multi(
+                        client,
+                        plans,
+                        cache,
+                        lua,
+                        conn,
+                        q_args,
+                        mutated_keys,
+                    )?;
                     results.push(res);
                 }
                 return Ok(RespValue::Array(results));
@@ -145,16 +335,31 @@ pub fn dispatch_with_spi(
         }
         "EXEC" => Ok(RespValue::err("ERR EXEC without MULTI")),
         "DISCARD" => Ok(RespValue::err("ERR DISCARD without MULTI")),
-        _ => dispatch_single_non_multi(client, plans, cache, conn, args),
+        _ => dispatch_single_non_multi(client, plans, cache, lua, conn, args, mutated_keys),
     }
+}
+
+/// Entry point for `redis.call(...)` and `redis.pcall(...)` inside Lua scripts.
+/// Executes directly in the active PostgreSQL SPI transaction (no nested `EVAL`).
+pub fn dispatch_from_lua(
+    client: &mut SpiClient,
+    plans: Option<&PreparedPlans>,
+    cache: Option<&L1Cache>,
+    conn: &mut ConnectionState,
+    args: &[Bytes],
+    mutated_keys: &mut Vec<String>,
+) -> SpiResult<RespValue> {
+    dispatch_single_non_multi(client, plans, cache, None, conn, args, mutated_keys)
 }
 
 fn dispatch_single_non_multi(
     client: &mut SpiClient,
     plans: Option<&PreparedPlans>,
     cache: Option<&L1Cache>,
+    lua: Option<&LuaEngine>,
     conn: &mut ConnectionState,
     args: &[Bytes],
+    mutated_keys: &mut Vec<String>,
 ) -> SpiResult<RespValue> {
     let cmd = cmd_name_upper(args);
 
@@ -171,6 +376,29 @@ fn dispatch_single_non_multi(
         "CONFIG" => Ok(server::cmd_config(args)),
         "TIME" => Ok(server::cmd_time()),
         "AUTH" => Ok(RespValue::ok()),
+
+        // Lua 5.1 Scripting
+        "SCRIPT" => Ok(handle_script_cmd(lua, args)),
+        "EVAL" | "EVAL_RO" => Ok(handle_eval_cmd(
+            false,
+            client,
+            plans,
+            cache,
+            lua,
+            conn,
+            args,
+            mutated_keys,
+        )),
+        "EVALSHA" | "EVALSHA_RO" => Ok(handle_eval_cmd(
+            true,
+            client,
+            plans,
+            cache,
+            lua,
+            conn,
+            args,
+            mutated_keys,
+        )),
 
         // Strings
         "GET" => strings::cmd_get(client, plans, cache, args),
@@ -201,6 +429,7 @@ fn dispatch_single_non_multi(
         "PTTL" => keys::cmd_ttl(client, args, true),
         "PERSIST" => keys::cmd_persist(client, cache, args),
         "TYPE" => keys::cmd_type(client, args),
+        "RENAME" => keys::cmd_rename(client, cache, args, mutated_keys),
         "KEYS" => keys::cmd_keys(client, args),
         "SCAN" => keys::cmd_scan(client, args),
         "DBSIZE" => keys::cmd_dbsize(client),
@@ -222,8 +451,8 @@ fn dispatch_single_non_multi(
         "HINCRBYFLOAT" => hashes::cmd_hincrbyfloat(client, plans, args),
 
         // Lists
-        "LPUSH" => lists::cmd_push(client, args, true),
-        "RPUSH" => lists::cmd_push(client, args, false),
+        "LPUSH" => lists::cmd_push(client, args, true, mutated_keys),
+        "RPUSH" => lists::cmd_push(client, args, false, mutated_keys),
         "LPOP" => lists::cmd_pop(client, args, true),
         "RPOP" => lists::cmd_pop(client, args, false),
         "LRANGE" => lists::cmd_lrange(client, args),
@@ -231,20 +460,67 @@ fn dispatch_single_non_multi(
         "LINDEX" => lists::cmd_lindex(client, args),
         "LSET" => lists::cmd_lset(client, args),
         "LREM" => lists::cmd_lrem(client, args),
+        "LTRIM" => lists::cmd_ltrim(client, args),
+        "LPOS" => lists::cmd_lpos(client, args),
+        "RPOPLPUSH" => lists::cmd_rpoplpush(client, args, mutated_keys),
+        "LMOVE" => lists::cmd_lmove_cmd(client, args, mutated_keys),
 
         // Sorted Sets
-        "ZADD" => zsets::cmd_zadd(client, plans, args),
+        "ZADD" => zsets::cmd_zadd(client, plans, args, mutated_keys),
         "ZRANGE" => zsets::cmd_zrange(client, args, false),
         "ZREVRANGE" => zsets::cmd_zrange(client, args, true),
         "ZRANGEBYSCORE" => zsets::cmd_zrangebyscore(client, args, false),
         "ZREVRANGEBYSCORE" => zsets::cmd_zrangebyscore(client, args, true),
         "ZREM" => zsets::cmd_zrem(client, args),
+        "ZREMRANGEBYRANK" => zsets::cmd_zremrangebyrank(client, args),
+        "ZREMRANGEBYSCORE" => zsets::cmd_zremrangebyscore(client, args),
+        "ZPOPMIN" => zsets::cmd_zpop(client, args, false),
+        "ZPOPMAX" => zsets::cmd_zpop(client, args, true),
         "ZSCORE" => zsets::cmd_zscore(client, plans, args),
         "ZCARD" => zsets::cmd_zcard(client, args),
         "ZRANK" => zsets::cmd_zrank(client, args, false),
         "ZREVRANK" => zsets::cmd_zrank(client, args, true),
-        "ZINCRBY" => zsets::cmd_zincrby(client, plans, args),
+        "ZINCRBY" => zsets::cmd_zincrby(client, plans, args, mutated_keys),
         "ZCOUNT" => zsets::cmd_zcount(client, args),
+
+        // Sets
+        "SADD" => sets::cmd_sadd(client, args),
+        "SREM" => sets::cmd_srem(client, args),
+        "SMEMBERS" => sets::cmd_smembers(client, args),
+        "SISMEMBER" => sets::cmd_sismember(client, args),
+        "SCARD" => sets::cmd_scard(client, args),
+        "SPOP" => sets::cmd_spop(client, args),
+
+        // Streams
+        "XADD" => streams::cmd_xadd(client, args, mutated_keys),
+        "XTRIM" => streams::cmd_xtrim(client, args),
+        "XLEN" => streams::cmd_xlen(client, args),
+        "XDEL" => streams::cmd_xdel(client, args),
+        "XRANGE" => streams::cmd_xrange(client, args, false),
+        "XREVRANGE" => streams::cmd_xrange(client, args, true),
+        "XREAD" => streams::cmd_xread_nonblocking(client, args),
+
+        // Non-blocking fallback if called inside MULTI/Lua
+        "BZPOPMIN" | "BZPOPMAX" => {
+            if args.len() < 3 {
+                return Ok(RespValue::wrong_arity(&cmd));
+            }
+            let keys: Vec<String> = args[1..args.len() - 1]
+                .iter()
+                .map(|b| String::from_utf8_lossy(b).into_owned())
+                .collect();
+            Ok(zsets::try_bzpop_once(client, &keys, cmd == "BZPOPMAX")?.unwrap_or(RespValue::Null))
+        }
+        "BLPOP" | "BRPOP" => {
+            if args.len() < 3 {
+                return Ok(RespValue::wrong_arity(&cmd));
+            }
+            let keys: Vec<String> = args[1..args.len() - 1]
+                .iter()
+                .map(|b| String::from_utf8_lossy(b).into_owned())
+                .collect();
+            Ok(lists::try_blpop_once(client, &keys, cmd == "BRPOP")?.unwrap_or(RespValue::Null))
+        }
 
         _ => Ok(RespValue::err(format!(
             "ERR unknown command '{}'",
@@ -253,24 +529,21 @@ fn dispatch_single_non_multi(
     }
 }
 
-/// Execute a pipelined batch of commands inside the background worker.
-///
-/// - Commands that can be satisfied purely in memory (protocol/server commands,
-///   L1 cache hits, MULTI queueing) are resolved without starting a PostgreSQL transaction.
-/// - As soon as any command requires PostgreSQL SPI, all remaining commands in the
-///   batch execute together inside a SINGLE `BackgroundWorker::transaction` block (RFC §5.4).
+/// Execute a pipelined batch of non-blocking commands inside the background worker.
+/// Notifies any blocked clients AFTER the PostgreSQL transaction commits.
 pub fn execute_batch_in_worker(
     batch: Vec<Vec<Bytes>>,
     plans: Option<&PreparedPlans>,
     cache: Option<&L1Cache>,
+    lua: Option<&LuaEngine>,
+    notifier: Option<&KeyNotifier>,
     conn: &mut ConnectionState,
 ) -> Vec<(RespValue, RespVersion)> {
     let mut responses = Vec::with_capacity(batch.len());
     let mut idx = 0;
 
-    // Fast path: resolve leading in-memory / L1-cached commands without starting a PG transaction
     while idx < batch.len() {
-        if let Some(val) = try_execute_in_memory(&batch[idx], conn, cache) {
+        if let Some(val) = try_execute_in_memory(&batch[idx], conn, cache, lua) {
             responses.push((val, conn.protocol));
             idx += 1;
             if conn.should_quit {
@@ -285,35 +558,44 @@ pub fn execute_batch_in_worker(
         return responses;
     }
 
-    // Execute all remaining commands in the batch inside a single SPI transaction
     let remaining = &batch[idx..];
-    let mut conn_guard = std::panic::AssertUnwindSafe(conn);
-    let cache_guard = std::panic::AssertUnwindSafe(cache);
-    let plans_guard = std::panic::AssertUnwindSafe(plans);
-    let rem_guard = std::panic::AssertUnwindSafe(remaining);
+    let mut conn_guard = AssertUnwindSafe(conn);
+    let cache_guard = AssertUnwindSafe(cache);
+    let plans_guard = AssertUnwindSafe(plans);
+    let lua_guard = AssertUnwindSafe(lua);
+    let rem_guard = AssertUnwindSafe(remaining);
 
-    let tx_results: Vec<(RespValue, RespVersion)> = BackgroundWorker::transaction(move || {
-        Spi::connect(|mut client| {
-            let mut out = Vec::with_capacity(rem_guard.len());
-            for args in *rem_guard {
-                let val = match dispatch_with_spi(
-                    &mut client,
-                    *plans_guard,
-                    *cache_guard,
-                    *conn_guard,
-                    args,
-                ) {
-                    Ok(v) => v,
-                    Err(e) => RespValue::err(format!("ERR internal database SPI error: {e}")),
-                };
-                out.push((val, conn_guard.protocol));
-                if conn_guard.should_quit {
-                    break;
+    let (tx_results, mutated_keys): (Vec<(RespValue, RespVersion)>, Vec<String>) =
+        BackgroundWorker::transaction(move || {
+            Spi::connect(|mut client| {
+                let mut out = Vec::with_capacity(rem_guard.len());
+                let mut mutated = Vec::new();
+                for args in *rem_guard {
+                    let val = match dispatch_with_spi(
+                        &mut client,
+                        *plans_guard,
+                        *cache_guard,
+                        *lua_guard,
+                        *conn_guard,
+                        args,
+                        &mut mutated,
+                    ) {
+                        Ok(v) => v,
+                        Err(e) => RespValue::err(format!("ERR internal database SPI error: {e}")),
+                    };
+                    out.push((val, conn_guard.protocol));
+                    if conn_guard.should_quit {
+                        break;
+                    }
                 }
-            }
-            out
-        })
-    });
+                (out, mutated)
+            })
+        });
+
+    // Notify blocked waiters AFTER transaction commit so new rows are 100% visible via MVCC
+    if let Some(n) = notifier {
+        n.notify_many(&mutated_keys);
+    }
 
     responses.extend(tx_results);
     responses

@@ -84,6 +84,23 @@ Each TCP connection tracks its own `ConnectionState`:
 - Encodes `Map` responses (`HGETALL`, `HELLO`) as flat arrays in RESP2 and `%N\r\n` maps in RESP3; encodes `ScoredArray` (`ZRANGE ... WITHSCORES`) as flat bulk strings in RESP2 and nested `[member, Double]` tuples in RESP3.
 - Supports inline text commands (`PING\r\n`, `SET foo "bar baz"\r\n`) alongside multibulk arrays (`*N\r\n...`).
 
+## Embedded Lua 5.1 Scripting (`mlua`) & Why Not `pllua-ng`
+
+While PostgreSQL has a standalone procedural language extension (**`pllua` / `pllua-ng`**) for writing SQL stored procedures and triggers in Lua 5.3/5.4, Redis scripting (and job frameworks like **BullMQ 5.13.0**) requires:
+
+- **Exact Lua 5.1 semantics** (`unpack()`, `bit` library, Lua 5.1 coercion rules),
+- **Redis-specific libraries and globals**: binary-safe `KEYS` / `ARGV`, `redis.call` / `redis.pcall`, `cjson`, `cmsgpack` (used by BullMQ for job arguments and options), and exact Lua↔RESP type conversions (`nil` bulk reply → `false`, `{ok=...}`, `{err=...}`),
+- **Zero-hop transactional execution** inside the active PostgreSQL SPI transaction.
+
+`pg_redis_core` therefore embeds **Lua 5.1 directly inside the Rust background worker** via `mlua` (`features = ["lua51", "vendored"]`), caching compiled chunks by 40-char SHA1 (`SCRIPT LOAD` / `EVALSHA`) and executing `redis.call(...)` directly against the active PostgreSQL SPI transaction with full ACID atomicity.
+
+## Cooperative Blocking Wakeups (`BZPOPMIN`, `BLPOP`, `XREAD BLOCK`)
+
+Blocking commands are handled asynchronously on the background worker's `LocalSet` via `KeyNotifier` (`tokio::sync::Notify` per watched key):
+
+- Idle workers (such as BullMQ workers blocked on `BZPOPMIN bull:<queue>:marker <timeout>` or `QueueEvents` blocked on `XREAD BLOCK ... STREAMS ...`) yield without holding a PostgreSQL transaction or burning CPU.
+- Whenever any command — direct or inside a Lua script (`ZADD`, `LPUSH`, `RPUSH`, `XADD`) — commits a mutation, `KeyNotifier` wakes waiting tasks **immediately after PostgreSQL transaction commit**, guaranteeing MVCC visibility and sub-millisecond wakeup latency.
+
 ## Signal Handling & Clean Shutdown
 
 During PostgreSQL startup/shutdown (including Docker's temporary `initdb` server cycle), the background worker monitors `BackgroundWorker::sigterm_received()` and `wait_latch` return status via an atomic `SHUTDOWN_REQUESTED` latch. On `SIGTERM`, a `tokio::sync::watch` channel terminates the accept loop and active client handlers within 50ms, dropping `TcpListener` immediately so `pg_ctl stop` completes cleanly.

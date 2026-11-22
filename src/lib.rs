@@ -1,6 +1,8 @@
 mod cache;
 mod commands;
 mod config;
+mod lua;
+mod notify;
 mod protocol;
 mod storage;
 mod worker;
@@ -46,7 +48,7 @@ CREATE TABLE IF NOT EXISTS pg_redis_lists (
 CREATE INDEX IF NOT EXISTS idx_redis_lists_key_seq
 ON pg_redis_lists(key, seq);
 
--- 4. Sorted Sets (ZADD, ZRANGE, ZREM, ZSCORE)
+-- 4. Sorted Sets (ZADD, ZRANGE, ZREM, ZSCORE, ZPOPMIN)
 CREATE TABLE IF NOT EXISTS pg_redis_zsets (
     key TEXT,
     member TEXT,
@@ -56,6 +58,28 @@ CREATE TABLE IF NOT EXISTS pg_redis_zsets (
 
 CREATE INDEX IF NOT EXISTS idx_redis_zsets_score
 ON pg_redis_zsets(key, score);
+
+-- 5. Sets (SADD, SREM, SMEMBERS, SISMEMBER, SCARD)
+CREATE TABLE IF NOT EXISTS pg_redis_sets (
+    key TEXT,
+    member TEXT,
+    PRIMARY KEY (key, member)
+) WITH (fillfactor = 80);
+
+CREATE INDEX IF NOT EXISTS idx_redis_sets_key
+ON pg_redis_sets(key);
+
+-- 6. Streams (XADD, XTRIM, XREAD, XRANGE, XREVRANGE, XLEN, XDEL)
+CREATE TABLE IF NOT EXISTS pg_redis_streams (
+    key TEXT,
+    ms BIGINT,
+    seq BIGINT,
+    fields TEXT,
+    PRIMARY KEY (key, ms, seq)
+) WITH (fillfactor = 80);
+
+CREATE INDEX IF NOT EXISTS idx_redis_streams_key_id
+ON pg_redis_streams(key, ms, seq);
 "#,
     name = "pg_redis_schema",
     bootstrap
@@ -93,9 +117,27 @@ pub fn redis_dispatcher(
         args.push(Bytes::from(a2));
     }
 
+    let lua_engine = if args[0].eq_ignore_ascii_case(b"EVAL")
+        || args[0].eq_ignore_ascii_case(b"EVAL_RO")
+        || args[0].eq_ignore_ascii_case(b"SCRIPT")
+    {
+        lua::LuaEngine::new().ok()
+    } else {
+        None
+    };
+
     let mut conn = commands::ConnectionState::new(0);
+    let mut mutated = Vec::new();
     let result = Spi::connect(|mut client| {
-        commands::dispatch_with_spi(&mut client, None, None, &mut conn, &args)
+        commands::dispatch_with_spi(
+            &mut client,
+            None,
+            None,
+            lua_engine.as_ref(),
+            &mut conn,
+            &args,
+            &mut mutated,
+        )
     });
 
     match result {
@@ -111,7 +153,7 @@ pub fn pg_redis_evict_expired() -> i64 {
         .unwrap_or(0) as i64
 }
 
-/// Toggle all four `pg_redis_*` catalog tables between `UNLOGGED` and `LOGGED` mode (RFC §5.1).
+/// Toggle all `pg_redis_*` catalog tables between `UNLOGGED` and `LOGGED` mode (RFC §5.1).
 #[pg_extern]
 pub fn pg_redis_set_unlogged(unlogged: bool) -> bool {
     Spi::connect(|mut client| storage::set_tables_unlogged(&mut client, unlogged)).is_ok()
@@ -267,7 +309,7 @@ mod tests {
     }
 
     #[pg_test]
-    fn test_zsets_roundtrip() {
+    fn test_zsets_and_zpopmin_roundtrip() {
         assert_eq!(
             crate::redis_dispatcher(
                 "ZADD".to_string(),
@@ -296,6 +338,10 @@ mod tests {
             "*2\r\n$3\r\nbob\r\n$5\r\nalice\r\n"
         );
         assert_eq!(
+            crate::redis_dispatcher("ZPOPMIN".to_string(), Some("lb".to_string()), None, None),
+            "*2\r\n$3\r\nbob\r\n$2\r\n50\r\n"
+        );
+        assert_eq!(
             crate::redis_dispatcher(
                 "ZSCORE".to_string(),
                 Some("lb".to_string()),
@@ -304,15 +350,43 @@ mod tests {
             ),
             "$3\r\n100\r\n"
         );
+    }
+
+    #[pg_test]
+    fn test_sets_and_lua_xadd() {
         assert_eq!(
             crate::redis_dispatcher(
-                "ZREM".to_string(),
-                Some("lb".to_string()),
-                Some("bob".to_string()),
+                "SADD".to_string(),
+                Some("deps:1".to_string()),
+                Some("job:2".to_string()),
                 None
             ),
             ":1\r\n"
         );
+        assert_eq!(
+            crate::redis_dispatcher(
+                "SISMEMBER".to_string(),
+                Some("deps:1".to_string()),
+                Some("job:2".to_string()),
+                None
+            ),
+            ":1\r\n"
+        );
+
+        let lua_res = crate::redis_dispatcher(
+            "EVAL".to_string(),
+            Some(
+                "local id = redis.call('XADD', KEYS[1], '*', 'event', 'waiting', 'jobId', '1') \
+                 local packed = cmsgpack.pack({ok = true, id = id}) \
+                 local unpacked = cmsgpack.unpack(packed) \
+                 return cjson.encode({id = unpacked['id'], len = redis.call('XLEN', KEYS[1])})"
+                    .to_string(),
+            ),
+            Some("1".to_string()),
+            Some("bull:orders:events".to_string()),
+        );
+        assert!(lua_res.starts_with('$'));
+        assert!(lua_res.contains("\"len\":1"));
     }
 
     #[pg_test]

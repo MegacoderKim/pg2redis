@@ -10,7 +10,8 @@ hide:
   <span class="hero-badge">PostgreSQL 15+</span>
   <span class="hero-badge">Rust + pgrx 0.11</span>
   <span class="hero-badge">RESP2 &amp; RESP3</span>
-  <span class="hero-badge">Tokio + SPI</span>
+  <span class="hero-badge">Lua 5.1 (EVAL/EVALSHA)</span>
+  <span class="hero-badge">BullMQ 5.13 Ready</span>
   <span class="hero-badge">L1 moka Cache</span>
 </div>
 
@@ -67,11 +68,11 @@ Speak native **Redis (RESP2 &amp; RESP3)** on port `6379` directly inside **Post
 
     Combines an in-process `moka` L1 hot-key cache, `SPI_keepplan` prepared statements, pipelined transaction batching, `fillfactor = 80` HOT updates, and optional `UNLOGGED` WAL bypass.
 
--   :material-language-python:{ .lg .middle } **Drop-In Driver Compatibility**
+-   :material-language-python:{ .lg .middle } **Drop-In Driver & BullMQ Compatibility**
 
     ---
 
-    Verified against unmodified `redis-py` / `FastAPI`, `Jedis` (Kotlin/JVM), `go-redis/v9` (RESP3 `HELLO 3`), `redis-cli`, and raw TCP RESP sessions.
+    Verified against unmodified **BullMQ 5.13.0** (Medusa queues: Lua 5.1 + `cmsgpack` + `cjson` + `XADD` + `BZPOPMIN`), `redis-py` / `FastAPI`, `Jedis` (Kotlin), `go-redis/v9` (RESP3), and `redis-cli`.
 
 </div>
 

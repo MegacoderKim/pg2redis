@@ -36,7 +36,12 @@ echo "============================================================"
 docker compose --profile test run --rm --build test-kotlin
 
 echo "============================================================"
-echo " 6. Running pgrx in-PostgreSQL tests (cargo pgrx test & run pg15)"
+echo " 6. Running Node.js BullMQ 5.13.0 (Medusa / Lua 5.1 / XADD / BZPOPMIN)"
+echo "============================================================"
+docker compose --profile test run --rm --build test-bullmq
+
+echo "============================================================"
+echo " 7. Running pgrx in-PostgreSQL tests (cargo pgrx test & run pg15)"
 echo "============================================================"
 docker build --target dev -f docker/Dockerfile -t pg_redis_core:dev .
 docker run --rm pg_redis_core:dev sh -c "

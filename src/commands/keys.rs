@@ -54,7 +54,13 @@ pub fn cmd_del(
             )?;
         }
 
-        for table in ["pg_redis_hashes", "pg_redis_lists", "pg_redis_zsets"] {
+        for table in [
+            "pg_redis_hashes",
+            "pg_redis_lists",
+            "pg_redis_zsets",
+            "pg_redis_sets",
+            "pg_redis_streams",
+        ] {
             let sql = format!("DELETE FROM {table} WHERE key = $1");
             let res = client.update(
                 &sql,
@@ -93,6 +99,8 @@ pub fn cmd_exists(client: &SpiClient, args: &[Bytes]) -> SpiResult<RespValue> {
                     OR EXISTS(SELECT 1 FROM pg_redis_hashes WHERE key = $1) \
                     OR EXISTS(SELECT 1 FROM pg_redis_lists WHERE key = $1) \
                     OR EXISTS(SELECT 1 FROM pg_redis_zsets WHERE key = $1) \
+                    OR EXISTS(SELECT 1 FROM pg_redis_sets WHERE key = $1) \
+                    OR EXISTS(SELECT 1 FROM pg_redis_streams WHERE key = $1) \
                 )",
                 None,
                 Some(vec![(PgBuiltInOids::TEXTOID.oid(), key.into_datum())]),
@@ -202,6 +210,8 @@ pub fn cmd_ttl(client: &SpiClient, args: &[Bytes], millis: bool) -> SpiResult<Re
                 EXISTS(SELECT 1 FROM pg_redis_hashes WHERE key = $1) \
                 OR EXISTS(SELECT 1 FROM pg_redis_lists WHERE key = $1) \
                 OR EXISTS(SELECT 1 FROM pg_redis_zsets WHERE key = $1) \
+                OR EXISTS(SELECT 1 FROM pg_redis_sets WHERE key = $1) \
+                OR EXISTS(SELECT 1 FROM pg_redis_streams WHERE key = $1) \
             )",
             None,
             Some(vec![(PgBuiltInOids::TEXTOID.oid(), key.into_datum())]),
@@ -247,6 +257,8 @@ pub fn cmd_type(client: &SpiClient, args: &[Bytes]) -> SpiResult<RespValue> {
                 WHEN EXISTS(SELECT 1 FROM pg_redis_hashes WHERE key = $1) THEN 'hash' \
                 WHEN EXISTS(SELECT 1 FROM pg_redis_lists WHERE key = $1) THEN 'list' \
                 WHEN EXISTS(SELECT 1 FROM pg_redis_zsets WHERE key = $1) THEN 'zset' \
+                WHEN EXISTS(SELECT 1 FROM pg_redis_sets WHERE key = $1) THEN 'set' \
+                WHEN EXISTS(SELECT 1 FROM pg_redis_streams WHERE key = $1) THEN 'stream' \
                 ELSE 'none' \
              END",
             None,
@@ -258,6 +270,94 @@ pub fn cmd_type(client: &SpiClient, args: &[Bytes]) -> SpiResult<RespValue> {
     Ok(RespValue::simple(t.unwrap_or_else(|| "none".to_string())))
 }
 
+/// `RENAME key newkey` — atomically moves a key across all catalog tables, overwriting `newkey`.
+pub fn cmd_rename(
+    client: &mut SpiClient,
+    cache: Option<&L1Cache>,
+    args: &[Bytes],
+    mutated_keys: &mut Vec<String>,
+) -> SpiResult<RespValue> {
+    if args.len() != 3 {
+        return Ok(RespValue::wrong_arity("rename"));
+    }
+    let old_key = as_str(&args[1]);
+    let new_key = as_str(&args[2]);
+
+    let key_type: String = client
+        .select(
+            "SELECT CASE \
+                WHEN EXISTS(SELECT 1 FROM pg_redis_strings WHERE key = $1 AND (expires_at IS NULL OR expires_at > NOW())) THEN 'string' \
+                WHEN EXISTS(SELECT 1 FROM pg_redis_hashes WHERE key = $1) THEN 'hash' \
+                WHEN EXISTS(SELECT 1 FROM pg_redis_lists WHERE key = $1) THEN 'list' \
+                WHEN EXISTS(SELECT 1 FROM pg_redis_zsets WHERE key = $1) THEN 'zset' \
+                WHEN EXISTS(SELECT 1 FROM pg_redis_sets WHERE key = $1) THEN 'set' \
+                WHEN EXISTS(SELECT 1 FROM pg_redis_streams WHERE key = $1) THEN 'stream' \
+                ELSE 'none' \
+             END",
+            None,
+            Some(vec![(PgBuiltInOids::TEXTOID.oid(), old_key.clone().into_datum())]),
+        )?
+        .first()
+        .get_one::<String>()?
+        .unwrap_or_else(|| "none".to_string());
+
+    if key_type == "none" {
+        return Ok(RespValue::err("ERR no such key"));
+    }
+
+    if old_key == new_key {
+        return Ok(RespValue::ok());
+    }
+
+    // Clear any existing target key across all catalog tables
+    for tbl in [
+        "pg_redis_strings",
+        "pg_redis_hashes",
+        "pg_redis_lists",
+        "pg_redis_zsets",
+        "pg_redis_sets",
+        "pg_redis_streams",
+    ] {
+        let del_sql = format!("DELETE FROM {tbl} WHERE key = $1");
+        client.update(
+            &del_sql,
+            None,
+            Some(vec![(PgBuiltInOids::TEXTOID.oid(), new_key.clone().into_datum())]),
+        )?;
+    }
+
+    let target_table = match key_type.as_str() {
+        "string" => "pg_redis_strings",
+        "hash" => "pg_redis_hashes",
+        "list" => "pg_redis_lists",
+        "zset" => "pg_redis_zsets",
+        "set" => "pg_redis_sets",
+        "stream" => "pg_redis_streams",
+        _ => return Ok(RespValue::err("ERR no such key")),
+    };
+
+    let upd_sql = format!("UPDATE {target_table} SET key = $2 WHERE key = $1");
+    client.update(
+        &upd_sql,
+        None,
+        Some(vec![
+            (PgBuiltInOids::TEXTOID.oid(), old_key.clone().into_datum()),
+            (PgBuiltInOids::TEXTOID.oid(), new_key.clone().into_datum()),
+        ]),
+    )?;
+
+    if let Some(c) = cache {
+        c.invalidate(&old_key);
+        c.invalidate(&new_key);
+    }
+
+    if matches!(key_type.as_str(), "list" | "zset" | "stream") {
+        mutated_keys.push(new_key);
+    }
+
+    Ok(RespValue::ok())
+}
+
 fn collect_all_keys(client: &SpiClient) -> SpiResult<Vec<String>> {
     let table = client.select(
         "SELECT key FROM pg_redis_strings WHERE expires_at IS NULL OR expires_at > NOW() \
@@ -266,7 +366,11 @@ fn collect_all_keys(client: &SpiClient) -> SpiResult<Vec<String>> {
          UNION \
          SELECT DISTINCT key FROM pg_redis_lists \
          UNION \
-         SELECT DISTINCT key FROM pg_redis_zsets",
+         SELECT DISTINCT key FROM pg_redis_zsets \
+         UNION \
+         SELECT DISTINCT key FROM pg_redis_sets \
+         UNION \
+         SELECT DISTINCT key FROM pg_redis_streams",
         None,
         None,
     )?;
@@ -375,7 +479,9 @@ pub fn cmd_flushdb(client: &mut SpiClient, cache: Option<&L1Cache>) -> SpiResult
         "DELETE FROM pg_redis_strings; \
          DELETE FROM pg_redis_hashes; \
          DELETE FROM pg_redis_lists; \
-         DELETE FROM pg_redis_zsets;",
+         DELETE FROM pg_redis_zsets; \
+         DELETE FROM pg_redis_sets; \
+         DELETE FROM pg_redis_streams;",
         None,
         None,
     )?;

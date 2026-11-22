@@ -40,7 +40,7 @@ CREATE TABLE IF NOT EXISTS pg_redis_lists (
 CREATE INDEX IF NOT EXISTS idx_redis_lists_key_seq
 ON pg_redis_lists(key, seq);
 
--- 4. Sorted Sets (ZADD, ZRANGE, ZREVRANGE, ZRANGEBYSCORE, ZREM, ZSCORE, ZRANK)
+-- 4. Sorted Sets (ZADD, ZRANGE, ZREVRANGE, ZRANGEBYSCORE, ZREM, ZSCORE, ZRANK, ZPOPMIN, BZPOPMIN)
 CREATE TABLE IF NOT EXISTS pg_redis_zsets (
     key TEXT,
     member TEXT,
@@ -50,6 +50,28 @@ CREATE TABLE IF NOT EXISTS pg_redis_zsets (
 
 CREATE INDEX IF NOT EXISTS idx_redis_zsets_score
 ON pg_redis_zsets(key, score);
+
+-- 5. Sets (SADD, SREM, SMEMBERS, SISMEMBER, SCARD, SPOP)
+CREATE TABLE IF NOT EXISTS pg_redis_sets (
+    key TEXT,
+    member TEXT,
+    PRIMARY KEY (key, member)
+) WITH (fillfactor = 80);
+
+CREATE INDEX IF NOT EXISTS idx_redis_sets_key
+ON pg_redis_sets(key);
+
+-- 6. Streams (XADD, XTRIM, XREAD, XRANGE, XREVRANGE, XLEN, XDEL)
+CREATE TABLE IF NOT EXISTS pg_redis_streams (
+    key TEXT,
+    ms BIGINT,
+    seq BIGINT,
+    fields TEXT,
+    PRIMARY KEY (key, ms, seq)
+) WITH (fillfactor = 80);
+
+CREATE INDEX IF NOT EXISTS idx_redis_streams_key_id
+ON pg_redis_streams(key, ms, seq);
 ```
 
 ## Mapping Design Highlights
