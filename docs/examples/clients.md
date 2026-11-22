@@ -6,6 +6,31 @@ All runnable Dockerized suites live under [`tests/clients/`](https://github.com/
 
 ## Multi-Language Quick Reference
 
+=== "Node.js (ioredis 5.11.1 Pub/Sub / Medusa Workflows)"
+
+    ```javascript title="tests/clients/pubsub/test_pubsub.mjs"
+    import Redis from "ioredis";
+
+    const sub = new Redis({ host: "localhost", port: 6379 });
+    const pub = new Redis({ host: "localhost", port: 6379 });
+
+    await sub.subscribe("medusa:workflow:create-order:tx_01");
+    sub.on("message", (channel, payload) => {
+      console.log("Workflow event:", channel, JSON.parse(payload));
+    });
+
+    const recipients = await pub.publish(
+      "medusa:workflow:create-order:tx_01",
+      JSON.stringify({ workflowId: "create-order-workflow", event: "step.succeeded" })
+    );
+    console.log("Delivered to", recipients, "subscriber(s)");
+    ```
+
+    **Run with Docker Compose:**
+    ```bash
+    docker compose --profile test run --rm --build test-pubsub
+    ```
+
 === "Node.js (BullMQ 5.13.0 / Medusa)"
 
     ```javascript title="tests/clients/bullmq/test_bullmq.mjs"

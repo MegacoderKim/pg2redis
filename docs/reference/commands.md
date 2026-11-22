@@ -1,6 +1,6 @@
 # Supported Redis Commands
 
-`pg_redis_core` supports **85+ Redis commands** over both **RESP2** and **RESP3** (plus inline commands), covering Strings, Keys/Expiry, Hashes, Lists, Sorted Sets, Sets, Streams, Blocking Operations (`BZPOPMIN`, `XREAD BLOCK`), Embedded Lua 5.1 Scripting (`EVAL`/`EVALSHA`/`SCRIPT`), Transactions, and Driver Handshakes — including full **BullMQ 5.13.0 / Medusa** compatibility.
+`pg_redis_core` supports **90+ Redis commands** over both **RESP2** and **RESP3** (plus inline commands), covering Strings, Keys/Expiry, Hashes, Lists, Sorted Sets, Sets, Streams, **Pub/Sub** (`PUBLISH`/`SUBSCRIBE`/`UNSUBSCRIBE`/`PUBSUB`), Blocking Operations (`BZPOPMIN`, `XREAD BLOCK`), Embedded Lua 5.1 Scripting (`EVAL`/`EVALSHA`/`SCRIPT`), Transactions, and Driver Handshakes — verified on **PostgreSQL 15 & 16** for **BullMQ 5.13.0** and **Medusa 2.22.7 (`ioredis 5.11.1`)**.
 
 ## Strings
 
@@ -122,14 +122,27 @@
 !!! info "Included Lua 5.1 Builtins (Exact Redis Sandbox Parity)"
     Powered by vendored **Lua 5.1 (`mlua`)** inside the background worker with `KEYS`, `ARGV` (binary-safe), `redis.call`, `redis.pcall`, `redis.status_reply`, `redis.error_reply`, `redis.sha1hex`, `redis.log`, **`cjson`**, **`cmsgpack`**, and **`bit`**.
 
+## Pub/Sub (Named Channels)
+
+| Command | Syntax | Notes |
+| --- | --- | --- |
+| `PUBLISH` | `PUBLISH channel message` | Binary-safe, arbitrary payload size (no 8 KB PG `NOTIFY` limit); returns exact live subscriber count; works inside Lua & `MULTI`/`EXEC` |
+| `SUBSCRIBE` | `SUBSCRIBE channel [channel ...]` | Emits `["subscribe", ch, total_count]` per channel (idempotent on duplicates); RESP3 Push (`>`) frames |
+| `UNSUBSCRIBE` | `UNSUBSCRIBE [channel ...]` | Unsubscribes specific channels or all channels (0 args) down to `0` (`["unsubscribe", null, 0]` if none) |
+| `PUBSUB` | `PUBSUB CHANNELS [pattern] \| NUMSUB [ch ...] \| NUMPAT` | Inspect active named channels and live subscriber counts |
+
+!!! note "Pub/Sub Scope"
+    Named-channel Pub/Sub (`PUBLISH`, `SUBSCRIBE`, `UNSUBSCRIBE`, `PUBSUB`) runs in-process inside the background worker's Tokio `LocalSet` with zero SPI overhead and automatic cleanup on disconnect. Pattern (`PSUBSCRIBE`/`PUNSUBSCRIBE`) and sharded (`SSUBSCRIBE`/`SUNSUBSCRIBE`) Pub/Sub are not implemented.
+
 ## Transactions & Server / Protocol
 
 | Command | Syntax | Notes |
 | --- | --- | --- |
 | `MULTI` / `EXEC` / `DISCARD` | `MULTI` ... `EXEC` | Atomic command queueing executed in a single SPI transaction |
 | `HELLO` | `HELLO [2\|3 [AUTH u p] [SETNAME name]]` | Dynamic RESP2 / RESP3 protocol negotiation |
-| `PING` / `ECHO` | `PING [msg]` / `ECHO msg` | Resolved in memory without SPI overhead |
-| `CLIENT` | `CLIENT SETINFO \| SETNAME \| GETNAME \| ID \| LIST \| INFO` | Full `go-redis/v9`, `redis-py`, and `Jedis` handshake support |
+| `PING` / `ECHO` | `PING [msg]` / `ECHO msg` | Resolved in memory without SPI overhead (returns `["pong", msg]` in RESP2 subscribed mode) |
+| `RESET` | `RESET` | Unsubscribes all channels, clears `MULTI` state, resets protocol to RESP2, returns `+RESET` |
+| `CLIENT` | `CLIENT SETINFO \| SETNAME \| GETNAME \| ID \| LIST \| INFO` | Full `go-redis/v9`, `redis-py`, `ioredis`, and `Jedis` handshake support |
 | `INFO` | `INFO [section]` | Reports `pg_redis_core` version, PG config, and L1 cache hit/miss stats |
 | `COMMAND` | `COMMAND [COUNT \| DOCS \| LIST]` | `redis-cli` interactive startup compatibility |
 | `CONFIG GET` | `CONFIG GET pattern` | Returns basic server config keys |

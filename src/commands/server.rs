@@ -137,25 +137,29 @@ pub fn cmd_client(conn: &mut ConnectionState, args: &[Bytes]) -> RespValue {
 }
 
 pub fn cmd_command(args: &[Bytes]) -> RespValue {
+    const CMDS: &[&str] = &[
+        "ping", "echo", "quit", "reset", "select", "hello", "client", "command", "info", "config",
+        "time", "auth", "multi", "exec", "discard", "publish", "subscribe", "unsubscribe",
+        "pubsub", "eval", "eval_ro", "evalsha", "evalsha_ro", "script", "get", "set", "setex",
+        "psetex", "setnx", "getset", "getdel", "mget", "mset", "incr", "incrby", "decr", "decrby",
+        "incrbyfloat", "append", "strlen", "del", "unlink", "exists", "expire", "pexpire",
+        "expireat", "pexpireat", "ttl", "pttl", "persist", "type", "rename", "keys", "scan",
+        "dbsize", "flushdb", "flushall", "hset", "hmset", "hsetnx", "hget", "hmget", "hgetall",
+        "hdel", "hexists", "hlen", "hkeys", "hvals", "hincrby", "hincrbyfloat", "lpush", "rpush",
+        "lpop", "rpop", "lrange", "llen", "lindex", "lset", "lrem", "ltrim", "lpos", "rpoplpush",
+        "lmove", "blpop", "brpop", "zadd", "zrange", "zrevrange", "zrangebyscore",
+        "zrevrangebyscore", "zrem", "zremrangebyrank", "zremrangebyscore", "zpopmin", "zpopmax",
+        "bzpopmin", "bzpopmax", "zscore", "zcard", "zrank", "zrevrank", "zincrby", "zcount",
+        "sadd", "srem", "smembers", "sismember", "scard", "spop", "xadd", "xtrim", "xlen", "xdel",
+        "xrange", "xrevrange", "xread",
+    ];
     if args.len() >= 2 {
         let sub = as_str(&args[1]).to_uppercase();
         match sub.as_str() {
-            "COUNT" => return RespValue::Integer(52),
+            "COUNT" => return RespValue::Integer(CMDS.len() as i64),
             "DOCS" => return RespValue::Map(Vec::new()),
             "LIST" => {
-                let cmds = [
-                    "ping", "echo", "quit", "select", "hello", "client", "info", "config", "time",
-                    "multi", "exec", "discard", "get", "set", "setex", "psetex", "setnx", "getset",
-                    "getdel", "mget", "mset", "incr", "incrby", "decr", "decrby", "incrbyfloat",
-                    "append", "strlen", "del", "unlink", "exists", "expire", "pexpire", "expireat",
-                    "pexpireat", "ttl", "pttl", "persist", "type", "keys", "scan", "dbsize",
-                    "flushdb", "flushall", "hset", "hmset", "hsetnx", "hget", "hmget", "hgetall",
-                    "hdel", "hexists", "hlen", "hkeys", "hvals", "hincrby", "hincrbyfloat",
-                    "lpush", "rpush", "lpop", "rpop", "lrange", "llen", "lindex", "lset", "lrem",
-                    "zadd", "zrange", "zrevrange", "zrangebyscore", "zrevrangebyscore", "zrem",
-                    "zscore", "zcard", "zrank", "zrevrank", "zincrby", "zcount",
-                ];
-                return RespValue::Array(cmds.into_iter().map(RespValue::bulk).collect());
+                return RespValue::Array(CMDS.iter().copied().map(RespValue::bulk).collect());
             }
             _ => return RespValue::Array(Vec::new()),
         }

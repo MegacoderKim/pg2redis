@@ -40,6 +40,9 @@ pub enum RespValue {
     /// Sorted-set member/score pairs: serialized as flat `[member, score_str, ...]` in RESP2,
     /// and `[[member, Double(score)], ...]` in RESP3.
     ScoredArray(Vec<(Bytes, f64)>),
+    /// Out-of-band push frame (Pub/Sub acks and messages):
+    /// serialized as standard Array (`*N\r\n`) in RESP2 and Push (`>N\r\n`) in RESP3.
+    Push(Vec<RespValue>),
 }
 
 impl RespValue {
@@ -285,6 +288,7 @@ fn to_resp2_frame(value: &RespValue) -> Resp2Frame {
             }
             Resp2Frame::Array(flat)
         }
+        RespValue::Push(items) => Resp2Frame::Array(items.iter().map(to_resp2_frame).collect()),
     }
 }
 
@@ -365,6 +369,14 @@ fn encode_resp3(value: &RespValue, out: &mut BytesMut) {
                 out.extend_from_slice(b"*2\r\n");
                 encode_resp3(&RespValue::BulkString(member.clone()), out);
                 encode_resp3(&RespValue::Double(*score), out);
+            }
+        }
+        RespValue::Push(items) => {
+            out.put_u8(b'>');
+            out.extend_from_slice(items.len().to_string().as_bytes());
+            out.extend_from_slice(b"\r\n");
+            for item in items {
+                encode_resp3(item, out);
             }
         }
     }

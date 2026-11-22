@@ -2,6 +2,23 @@
 
 All notable changes to `pg_redis_core` are documented in this file.
 
+## [0.3.0] - 2026-11-22
+
+### Added
+- **Redis Pub/Sub (`src/pubsub.rs`) for Medusa 2.22.7 workflow notifications (`ioredis 5.11.1`):**
+  - Named-channel `PUBLISH`, `SUBSCRIBE`, `UNSUBSCRIBE`, `PUBSUB CHANNELS [pattern]`, `PUBSUB NUMSUB [ch ...]`, `PUBSUB NUMPAT`, and `RESET`.
+  - Exact Redis wire acknowledgements (`["subscribe", ch, count]`, `["unsubscribe", ch, remaining]`, `["unsubscribe", null, 0]`, `["message", ch, payload]`), RESP3 Push frames (`>N`), idempotent duplicate subscriptions, multi-channel subscriptions, single-channel and zero-arg unsubscribe-all, and exact `PUBLISH` live recipient counts.
+  - Strict RESP2 subscribed-mode enforcement (allowing `SUBSCRIBE`, `UNSUBSCRIBE`, `PING` returning `["pong", msg]`, `QUIT`, and `RESET`) while permitting concurrent commands in RESP3.
+  - Zero-copy in-process `PubSubHub` over per-connection Tokio `mpsc::unbounded_channel` on the single-threaded background worker `LocalSet`: zero PostgreSQL SPI overhead, arbitrary binary-safe payloads exceeding PostgreSQL's 8 KB `NOTIFY` limit (verified at 32 KB+), strict FIFO ordering, idle subscribers never block other clients or BullMQ workers, and RAII `PubSubClientGuard` cleanup on disconnect.
+  - Support for `redis.call('PUBLISH', ...)` inside Lua 5.1 scripts and `PUBLISH` inside `MULTI`/`EXEC` transactions.
+- **PostgreSQL 16 Build & Release Matrix:**
+  - Parameterized `docker/Dockerfile` with `ARG PG_MAJOR=15` supporting both PostgreSQL 15 and PostgreSQL 16 (`cargo pgrx package --features pg15|pg16`).
+  - Expanded `.github/workflows/release.yml` to build, smoke-test, and publish prebuilt extension binaries and multi-arch GHCR images for `pg15-linux-amd64`, `pg15-linux-arm64`, `pg16-linux-amd64`, and `pg16-linux-arm64`.
+  - Added PostgreSQL extension upgrade script `sql/pg_redis_core--0.2.0--0.3.0.sql`.
+- **End-to-End Test Suites:**
+  - Added `tests/clients/pubsub/` pinning `ioredis@5.11.1` and `bullmq@5.13.0` covering all Pub/Sub edge cases, idle concurrency, disconnect/reconnect/resubscribe, 100-message FIFO ordering, binary safety, and 32 KB+ payloads.
+  - Added `tests/test_solar_nest_isolation.sh` verifying `pg_redis.database=solar_nest_redis` isolation from application database `solar_nest` alongside Pub/Sub + BullMQ 5.13.0 on both PostgreSQL 15 and PostgreSQL 16.
+
 ## [0.2.0] - 2026-11-22
 
 ### Added

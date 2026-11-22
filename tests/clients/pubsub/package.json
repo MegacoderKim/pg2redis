@@ -1,0 +1,9 @@
+{
+  "name": "pg-redis-pubsub-test",
+  "version": "1.0.0",
+  "type": "module",
+  "dependencies": {
+    "bullmq": "5.13.0",
+    "ioredis": "5.11.1"
+  }
+}

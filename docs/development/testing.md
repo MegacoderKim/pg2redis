@@ -12,12 +12,15 @@ Run the master end-to-end test harness:
 
 This script verifies all RFC acceptance criteria in sequence:
 
-1. **Runtime Docker Build (`docker/Dockerfile` `runtime` target):** Compiles `pg_redis_core` with `cargo pgrx package` (`pg15`) and installs the `.so`, `.control`, and generated `.sql` into `postgres:15-bookworm`.
+1. **Runtime Docker Build (`docker/Dockerfile` `runtime` target):** Compiles `pg_redis_core` with `cargo pgrx package` (`PG_MAJOR=15` or `16`) and installs the `.so`, `.control`, and generated `.sql` into `postgres:${PG_MAJOR}-bookworm`.
 2. **Raw TCP RESP Compliance (`tests/raw_resp_test.sh`):** Validates `*1\r\n$4\r\nPING\r\n` -> `+PONG\r\n`, inline `PING`, pipelined multi-command bursts, and RESP3 `HELLO 3`.
 3. **Python Integration Suite (`test-python`):** Runs `pytest` covering FastAPI gateway endpoints, binary-safe Strings, TTL expiration + `pg_redis_evict_expired()`, Hashes, Lists, Sorted Sets, pipelining, L1 cache hits, and direct PostgreSQL table parity via `psycopg`.
 4. **Go Integration Suite (`test-go`):** Runs `go-redis/v9` with default RESP3 negotiation across all data types, `ZRangeWithScores`, `Pipeline`, and `TxPipeline`.
 5. **Kotlin Integration Suite (`test-kotlin`):** Runs `Jedis 5.2.0` across Strings, Counters, Hashes, Lists, Sorted Sets, and pipelining.
-6. **In-PostgreSQL `pgrx` Unit Tests & `cargo pgrx run pg15` (`dev` target):** Runs `cargo pgrx test pg15` (all 7 `#[pg_test]` cases) and smoke-tests `cargo pgrx run pg15`.
+6. **BullMQ 5.13.0 Suite (`test-bullmq`):** Runs unmodified `bullmq@5.13.0` covering Lua 5.1 (`EVAL`/`EVALSHA`/`SCRIPT LOAD`/`cjson`/`cmsgpack`), Streams (`XADD`/`XREAD BLOCK`), and cooperative `BZPOPMIN`.
+7. **Pub/Sub Suite (`test-pubsub`):** Runs `ioredis@5.11.1` covering wire-level `SUBSCRIBE`/`UNSUBSCRIBE` acks & counts, Medusa 2.22.7 workflow payloads, multi-subscriber recipient counts, idle concurrency with BullMQ, abrupt disconnect cleanup, auto-resubscribe on reconnect, 100-message FIFO ordering, binary-safe payloads, and 32 KB+ payloads.
+8. **PostgreSQL 15 & 16 DB Isolation Suite (`./tests/test_solar_nest_isolation.sh 15 16`):** Exercises both PG 15 and PG 16 with `pg_redis.database=solar_nest_redis` kept isolated from application DB `solar_nest` alongside `test-pubsub` and `test-bullmq`.
+9. **In-PostgreSQL `pgrx` Unit Tests & `cargo pgrx run` (`dev` target):** Runs `cargo pgrx test pg15` / `pg16` (all 9 `#[pg_test]` cases) and smoke-tests `cargo pgrx run`.
 
 ## Running `cargo pgrx` Directly via Docker
 
@@ -63,7 +66,7 @@ All changes follow a branch-and-PR workflow into `main`:
      git tag -a v0.3.0 -m "pg_redis_core v0.3.0"
      git push origin v0.3.0
      ```
-   - `.github/workflows/release.yml` validates version parity, natively builds & smoke-tests both `linux/amd64` and `linux/arm64` PostgreSQL 15 extension tarballs, publishes a multi-arch Docker image to `ghcr.io/megacoderkim/pg2redis`, and creates the GitHub Release with `SHA256SUMS.txt`.
+   - `.github/workflows/release.yml` validates version parity, natively builds & smoke-tests `linux/amd64` and `linux/arm64` extension tarballs for both **PostgreSQL 15** and **PostgreSQL 16**, publishes multi-arch Docker images (`:vX.Y.Z-pg15`, `:vX.Y.Z-pg16`, and `:vX.Y.Z`) to `ghcr.io/megacoderkim/pg2redis`, and creates the GitHub Release with `SHA256SUMS.txt`.
 
 ## Project Layout
 

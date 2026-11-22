@@ -41,12 +41,17 @@ echo "============================================================"
 docker compose --profile test run --rm --build test-bullmq
 
 echo "============================================================"
-echo " 7. Running pgrx in-PostgreSQL tests (cargo pgrx test & run pg15)"
+echo " 7. Running Node.js ioredis 5.11.1 Pub/Sub (Medusa 2.22.7 workflows)"
 echo "============================================================"
-docker build --target dev -f docker/Dockerfile -t pg_redis_core:dev .
-docker run --rm pg_redis_core:dev sh -c "
+docker compose --profile test run --rm --build test-pubsub
+
+echo "============================================================"
+echo " 8. Running pgrx in-PostgreSQL tests (cargo pgrx test & run pg15)"
+echo "============================================================"
+docker build --target dev --build-arg PG_MAJOR=15 -f docker/Dockerfile -t pg_redis_core:dev-pg15 .
+docker run --rm pg_redis_core:dev-pg15 sh -c "
 set -e
-cargo pgrx test pg15
+cargo pgrx test pg15 --no-default-features --features pg15
 printf \"CREATE EXTENSION IF NOT EXISTS pg_redis_core;\nSELECT redis_dispatcher('PING', NULL, NULL, NULL);\n\" | cargo pgrx run pg15 | grep -q '+PONG'
 "
 
