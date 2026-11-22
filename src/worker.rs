@@ -356,7 +356,7 @@ async fn handle_connection(
             maybe_msg = pubsub_rx.recv() => {
                 match maybe_msg {
                     Some(msg) => ConnEvent::PubSub(msg),
-                    None => continue,
+                    None => ConnEvent::TcpClosed,
                 }
             }
             res = stream.read_buf(&mut read_buf) => {

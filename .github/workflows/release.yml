@@ -206,7 +206,7 @@ jobs:
           docker exec pg_smoke redis-cli INFO | grep -q "pg_redis_core_version:${VERSION}"
           docker exec pg_smoke redis-cli EVAL "return redis.call('XADD', KEYS[1], '*', 'event', 'release_ok')" 1 smoke:stream | grep -qE '^[0-9]+-[0-9]+$'
           docker exec pg_smoke redis-cli PUBLISH smoke:pubsub hello | grep -qx "0"
-          docker exec pg_smoke sh -c "
+          docker exec pg_smoke sh -ec "
             (sleep 1; redis-cli PUBLISH smoke:pubsub delivered > /tmp/pub_cnt) &
             PUB_PID=\$!
             timeout 5 stdbuf -oL redis-cli --csv SUBSCRIBE smoke:pubsub | head -n 3 | grep -q '\"delivered\"'
