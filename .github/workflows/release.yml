@@ -1,0 +1,54 @@
+name: Release Extension Artifacts
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build-linux-amd64:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Build packaged extension (PostgreSQL 15, linux-amd64)
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          VERSION="${TAG#v}"
+          docker build --target builder -f docker/Dockerfile -t pg_redis_core:builder .
+          CID=$(docker create pg_redis_core:builder)
+          mkdir -p dist/pkg
+          docker cp "${CID}:/out/." dist/pkg/
+          docker rm "${CID}"
+          tar -C dist/pkg -czf "dist/pg_redis_core-${VERSION}-pg15-linux-amd64.tar.gz" .
+          (cd dist && sha256sum "pg_redis_core-${VERSION}-pg15-linux-amd64.tar.gz" > "pg_redis_core-${VERSION}-pg15-linux-amd64.tar.gz.sha256")
+
+      - name: Upload linux-amd64 artifact to GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          VERSION="${TAG#v}"
+          # Wait briefly if release is being created concurrently
+          for i in 1 2 3 4 5; do
+            if gh release view "${TAG}" >/dev/null 2>&1; then
+              break
+            fi
+            sleep 3
+          done
+          if gh release view "${TAG}" >/dev/null 2>&1; then
+            gh release upload "${TAG}" \
+              "dist/pg_redis_core-${VERSION}-pg15-linux-amd64.tar.gz" \
+              "dist/pg_redis_core-${VERSION}-pg15-linux-amd64.tar.gz.sha256" \
+              --clobber
+          else
+            gh release create "${TAG}" \
+              "dist/pg_redis_core-${VERSION}-pg15-linux-amd64.tar.gz" \
+              "dist/pg_redis_core-${VERSION}-pg15-linux-amd64.tar.gz.sha256" \
+              --title "pg_redis_core ${TAG}" \
+              --generate-notes
+          fi

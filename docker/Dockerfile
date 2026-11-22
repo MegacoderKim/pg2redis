@@ -41,13 +41,15 @@ FROM builder-base AS builder
 WORKDIR /build
 COPY Cargo.toml pg_redis_core.control ./
 COPY src ./src
+COPY sql ./sql
 
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/build/target \
     cargo pgrx package --pg-config /usr/lib/postgresql/15/bin/pg_config --no-default-features --features pg15 \
     && mkdir -p /out \
-    && cp -a /build/target/release/pg_redis_core-pg15/. /out/
+    && cp -a /build/target/release/pg_redis_core-pg15/. /out/ \
+    && cp -a /build/sql/*.sql /out/usr/share/postgresql/15/extension/
 
 FROM builder-base AS dev
 

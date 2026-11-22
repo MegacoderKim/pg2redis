@@ -1,5 +1,6 @@
 # Rust / pgrx
 /target/
+/dist/
 **/*.rs.bk
 Cargo.lock
 
