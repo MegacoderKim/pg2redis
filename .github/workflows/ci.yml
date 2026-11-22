@@ -1,0 +1,29 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+jobs:
+  docs-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: |
+          pip install --no-cache-dir \
+            mkdocs==1.6.1 \
+            mkdocs-material==9.6.7 \
+            pymdown-extensions==10.14.3
+      - run: mkdocs build --strict
+
+  integration-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run full Dockerized test suite
+        run: ./tests/run_all_tests.sh

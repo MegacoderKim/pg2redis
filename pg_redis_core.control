@@ -1,0 +1,5 @@
+comment = 'pg_redis_core: High-Performance Redis Emulation Layer on PostgreSQL'
+default_version = '@CARGO_VERSION@'
+module_pathname = '$libdir/pg_redis_core'
+relocatable = false
+superuser = true

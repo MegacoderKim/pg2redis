@@ -1,0 +1,82 @@
+services:
+  pg-redis:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+      target: runtime
+    image: pg_redis_core:latest
+    container_name: pg_redis_core
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: postgres
+    ports:
+      - "5432:5432"
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d postgres && redis-cli -h 127.0.0.1 -p 6379 PING | grep -q PONG"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+      start_period: 3s
+
+  fastapi-gateway:
+    build:
+      context: ./tests/clients/python
+    environment:
+      REDIS_HOST: pg-redis
+      REDIS_PORT: "6379"
+    ports:
+      - "8000:8000"
+    depends_on:
+      pg-redis:
+        condition: service_healthy
+    profiles: ["gateway"]
+
+  test-python:
+    build:
+      context: ./tests/clients/python
+    environment:
+      REDIS_HOST: pg-redis
+      REDIS_PORT: "6379"
+      PGHOST: pg-redis
+      PGPORT: "5432"
+      PGUSER: postgres
+      PGPASSWORD: postgres
+      PGDATABASE: postgres
+    command: ["pytest", "-v", "test_integration.py"]
+    depends_on:
+      pg-redis:
+        condition: service_healthy
+    profiles: ["test"]
+
+  test-go:
+    build:
+      context: ./tests/clients/go
+    environment:
+      REDIS_ADDR: pg-redis:6379
+    depends_on:
+      pg-redis:
+        condition: service_healthy
+    profiles: ["test"]
+
+  test-kotlin:
+    build:
+      context: ./tests/clients/kotlin
+    environment:
+      REDIS_HOST: pg-redis
+      REDIS_PORT: "6379"
+    depends_on:
+      pg-redis:
+        condition: service_healthy
+    profiles: ["test"]
+
+  docs:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.docs
+    volumes:
+      - .:/docs
+    ports:
+      - "8080:8000"
+    profiles: ["docs"]

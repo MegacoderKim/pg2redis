@@ -1,0 +1,23 @@
+# Rust / pgrx
+/target/
+**/*.rs.bk
+Cargo.lock
+
+# MkDocs build output
+/site/
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+
+# Kotlin / Gradle
+**/.gradle/
+**/build/
+
+# macOS / Editors
+.DS_Store
+.idea/
+.vscode/
+*.swp
