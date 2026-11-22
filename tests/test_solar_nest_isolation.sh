@@ -30,6 +30,7 @@ CREATE DATABASE solar_nest_redis;
 \connect solar_nest_redis
 CREATE EXTENSION IF NOT EXISTS pg_redis_core;
 EOF
+chmod 644 "$INIT_SQL"
 
 cleanup() {
     for pg in "${PG_VERSIONS[@]}"; do
