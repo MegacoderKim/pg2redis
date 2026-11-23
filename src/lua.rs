@@ -1,7 +1,7 @@
 use bytes::Bytes;
 use mlua::{
-    Function, LightUserData, Lua, MultiValue, RegistryKey, Result as LuaResult, Table,
-    Value as LuaValue,
+    Function, HookTriggers, LightUserData, Lua, LuaOptions, MultiValue, RegistryKey,
+    Result as LuaResult, StdLib, Table, Value as LuaValue, VmState,
 };
 use pgrx::spi::SpiClient;
 use rmpv::Value as MsgPackValue;
@@ -12,9 +12,11 @@ use std::collections::HashMap;
 use std::ffi::c_void;
 use std::fmt::Write as _;
 use std::io::Cursor;
+use std::time::{Duration, Instant};
 
 use crate::cache::L1Cache;
 use crate::commands::{dispatch_from_lua, ConnectionState};
+use crate::config;
 use crate::protocol::{format_score, RespValue};
 use crate::pubsub::PubSubHub;
 use crate::storage::PreparedPlans;
@@ -57,7 +59,10 @@ pub struct LuaEngine {
 
 impl LuaEngine {
     pub fn new() -> Result<Self, String> {
-        let lua = Lua::new();
+        let safe_libs = StdLib::TABLE | StdLib::STRING | StdLib::MATH;
+        let lua =
+            Lua::new_with(safe_libs, LuaOptions::default()).map_err(|e| e.to_string())?;
+        sandbox_lua_globals(&lua).map_err(|e| e.to_string())?;
         install_redis_globals(&lua).map_err(|e| e.to_string())?;
         Ok(Self {
             lua,
@@ -183,6 +188,33 @@ impl LuaEngine {
             conn,
             mutated_keys,
         });
+
+        struct HookGuard<'a>(&'a Lua);
+        impl Drop for HookGuard<'_> {
+            fn drop(&mut self) {
+                self.0.remove_hook();
+            }
+        }
+
+        let limit_ms = config::lua_time_limit_ms();
+        let _hook_guard = if limit_ms > 0 {
+            let deadline = Instant::now() + Duration::from_millis(limit_ms);
+            self.lua.set_hook(
+                HookTriggers::new().every_nth_instruction(10_000),
+                move |_lua, _debug| {
+                    if Instant::now() >= deadline {
+                        Err(mlua::Error::RuntimeError(
+                            "ERR Lua script exceeded time limit".to_string(),
+                        ))
+                    } else {
+                        Ok(VmState::Continue)
+                    }
+                },
+            );
+            Some(HookGuard(&self.lua))
+        } else {
+            None
+        };
 
         let exec_result: LuaResult<RespValue> = self.lua.scope(|scope| {
             let redis_tbl: Table = globals.get("redis")?;
@@ -395,6 +427,24 @@ fn lua_to_resp(value: LuaValue) -> LuaResult<RespValue> {
         }
         _ => Ok(RespValue::Null),
     }
+}
+
+fn sandbox_lua_globals(lua: &Lua) -> LuaResult<()> {
+    let globals = lua.globals();
+    for forbidden in [
+        "os",
+        "io",
+        "package",
+        "debug",
+        "dofile",
+        "loadfile",
+        "collectgarbage",
+        "module",
+        "require",
+    ] {
+        globals.raw_set(forbidden, LuaValue::Nil)?;
+    }
+    Ok(())
 }
 
 fn install_redis_globals(lua: &Lua) -> LuaResult<()> {

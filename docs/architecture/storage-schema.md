@@ -1,6 +1,6 @@
 # Relational Storage Schema
 
-All Redis data structures map directly onto four purpose-built PostgreSQL catalog tables provisioned during `CREATE EXTENSION pg_redis_core` (and auto-provisioned on worker startup if missing).
+All Redis data structures map directly onto purpose-built PostgreSQL catalog tables provisioned during `CREATE EXTENSION pg_redis_core` (and auto-provisioned on worker startup if missing).
 
 Every table is created with `WITH (fillfactor = 80)` to reserve 20% free space per 8KB heap page for **Heap-Only Tuple (HOT)** updates.
 
@@ -72,6 +72,15 @@ CREATE TABLE IF NOT EXISTS pg_redis_streams (
 
 CREATE INDEX IF NOT EXISTS idx_redis_streams_key_id
 ON pg_redis_streams(key, ms, seq);
+
+-- 7. Universal Key Expiry (Hashes, Lists, ZSets, Sets, Streams)
+CREATE TABLE IF NOT EXISTS pg_redis_key_expiry (
+    key TEXT PRIMARY KEY,
+    expires_at TIMESTAMPTZ NOT NULL
+) WITH (fillfactor = 80);
+
+CREATE INDEX IF NOT EXISTS idx_redis_key_expiry_at
+ON pg_redis_key_expiry(expires_at);
 ```
 
 ## Mapping Design Highlights

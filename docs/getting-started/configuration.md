@@ -18,6 +18,11 @@ pg_redis.cache_enabled = on
 pg_redis.cache_capacity = 10000
 pg_redis.cache_ttl_ms = 500
 pg_redis.eviction_interval_ms = 5000
+pg_redis.requirepass = ''
+pg_redis.lua_time_limit_ms = 5000
+pg_redis.max_clients = 1000
+pg_redis.max_frame_bytes = 67108864
+pg_redis.pubsub_queue_size = 4096
 ```
 
 !!! note "Dynamic extension loading (`CREATE EXTENSION` without preloading)"
@@ -34,7 +39,12 @@ pg_redis.eviction_interval_ms = 5000
 | `pg_redis.cache_enabled` | `boolean` | `on` | SIGHUP | Enables the in-process `moka` L1 hot-key cache for `GET` reads. |
 | `pg_redis.cache_capacity` | `integer` | `10000` | Postmaster | Maximum number of entries retained in the L1 hot-key cache (`0`–`10000000`). |
 | `pg_redis.cache_ttl_ms` | `integer` | `500` | SIGHUP | Max milliseconds an L1 entry stays cached before revalidating against PostgreSQL. |
-| `pg_redis.eviction_interval_ms` | `integer` | `5000` | SIGHUP | Interval in milliseconds between automated `ctid`-batched TTL eviction passes. |
+| `pg_redis.eviction_interval_ms` | `integer` | `5000` | SIGHUP | Interval in milliseconds between automated `ctid`-batched TTL eviction passes (strings + non-string `pg_redis_key_expiry`). |
+| `pg_redis.requirepass` | `text` | *(unset)* | SIGHUP (`SUPERUSER_ONLY`) | Optional password enforced via `AUTH` / `HELLO ... AUTH` using constant-time comparison. Unset/empty disables auth. |
+| `pg_redis.lua_time_limit_ms` | `integer` | `5000` | SIGHUP | Maximum execution time in milliseconds for a single Lua `EVAL`/`EVALSHA` call (`0` disables). |
+| `pg_redis.max_clients` | `integer` | `1000` | SIGHUP | Maximum concurrent RESP TCP connections accepted by the worker (`1`–`100000`). |
+| `pg_redis.max_frame_bytes` | `integer` | `67108864` | SIGHUP | Maximum buffered RESP request size per connection (default 64 MiB). |
+| `pg_redis.pubsub_queue_size` | `integer` | `4096` | SIGHUP | Bounded message queue capacity per Pub/Sub subscriber before slow-consumer eviction. |
 
 Reload `SIGHUP` parameters live without restarting PostgreSQL:
 

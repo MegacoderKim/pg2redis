@@ -2,6 +2,7 @@ use bytes::Bytes;
 use pgrx::prelude::*;
 use pgrx::spi::{SpiClient, SpiResult};
 
+use crate::commands::keys;
 use crate::protocol::RespValue;
 
 fn as_str(b: &Bytes) -> String {
@@ -26,6 +27,7 @@ pub fn cmd_push(
     }
 
     let key = as_str(&args[1]);
+    keys::purge_if_expired_non_string(client, &key)?;
     let insert_sql = if left {
         "INSERT INTO pg_redis_lists (key, seq, value) \
          SELECT $1, COALESCE(MIN(seq), 1) - 1, $2 FROM pg_redis_lists WHERE key = $1"
@@ -83,6 +85,10 @@ pub fn cmd_pop(client: &mut SpiClient, args: &[Bytes], left: bool) -> SpiResult<
     let order = if left { "ASC" } else { "DESC" };
     let limit = count_arg.unwrap_or(1);
 
+    if keys::purge_if_expired_non_string(client, &key)? {
+        return Ok(RespValue::Null);
+    }
+
     if limit == 0 {
         return Ok(RespValue::Array(Vec::new()));
     }
@@ -104,7 +110,7 @@ pub fn cmd_pop(client: &mut SpiClient, args: &[Bytes], left: bool) -> SpiResult<
         &sql,
         None,
         Some(vec![
-            (PgBuiltInOids::TEXTOID.oid(), key.into_datum()),
+            (PgBuiltInOids::TEXTOID.oid(), key.clone().into_datum()),
             (PgBuiltInOids::INT8OID.oid(), limit.into_datum()),
         ]),
     )?;
@@ -119,6 +125,8 @@ pub fn cmd_pop(client: &mut SpiClient, args: &[Bytes], left: bool) -> SpiResult<
     if rows.is_empty() {
         return Ok(RespValue::Null);
     }
+
+    keys::cleanup_expiry_if_empty(client, "pg_redis_lists", &key)?;
 
     if left {
         rows.sort_by_key(|(seq, _)| *seq);
@@ -145,6 +153,9 @@ pub fn cmd_lrange(client: &SpiClient, args: &[Bytes]) -> SpiResult<RespValue> {
     let Some(mut stop) = parse_i64(&args[3]) else {
         return Ok(RespValue::not_integer_err());
     };
+    if keys::is_non_string_expired(client, &key)? {
+        return Ok(RespValue::Array(Vec::new()));
+    }
 
     let len = client
         .select(
@@ -200,6 +211,9 @@ pub fn cmd_llen(client: &SpiClient, args: &[Bytes]) -> SpiResult<RespValue> {
         return Ok(RespValue::wrong_arity("llen"));
     }
     let key = as_str(&args[1]);
+    if keys::is_non_string_expired(client, &key)? {
+        return Ok(RespValue::Integer(0));
+    }
     let len = client
         .select(
             "SELECT COUNT(*)::BIGINT FROM pg_redis_lists WHERE key = $1",
@@ -220,6 +234,9 @@ pub fn cmd_lindex(client: &SpiClient, args: &[Bytes]) -> SpiResult<RespValue> {
     let Some(mut idx) = parse_i64(&args[2]) else {
         return Ok(RespValue::not_integer_err());
     };
+    if keys::is_non_string_expired(client, &key)? {
+        return Ok(RespValue::Null);
+    }
 
     let len = client
         .select(
@@ -265,6 +282,7 @@ pub fn cmd_lset(client: &mut SpiClient, args: &[Bytes]) -> SpiResult<RespValue> 
         return Ok(RespValue::not_integer_err());
     };
     let value = as_str(&args[3]);
+    keys::purge_if_expired_non_string(client, &key)?;
 
     let len = client
         .select(
@@ -313,13 +331,16 @@ pub fn cmd_lrem(client: &mut SpiClient, args: &[Bytes]) -> SpiResult<RespValue> 
         return Ok(RespValue::not_integer_err());
     };
     let element = as_str(&args[3]);
+    if keys::purge_if_expired_non_string(client, &key)? {
+        return Ok(RespValue::Integer(0));
+    }
 
     let res = if count == 0 {
         client.update(
             "DELETE FROM pg_redis_lists WHERE key = $1 AND value = $2",
             None,
             Some(vec![
-                (PgBuiltInOids::TEXTOID.oid(), key.into_datum()),
+                (PgBuiltInOids::TEXTOID.oid(), key.clone().into_datum()),
                 (PgBuiltInOids::TEXTOID.oid(), element.into_datum()),
             ]),
         )?
@@ -339,14 +360,19 @@ pub fn cmd_lrem(client: &mut SpiClient, args: &[Bytes]) -> SpiResult<RespValue> 
             &sql,
             None,
             Some(vec![
-                (PgBuiltInOids::TEXTOID.oid(), key.into_datum()),
+                (PgBuiltInOids::TEXTOID.oid(), key.clone().into_datum()),
                 (PgBuiltInOids::TEXTOID.oid(), element.into_datum()),
                 (PgBuiltInOids::INT8OID.oid(), limit.into_datum()),
             ]),
         )?
     };
 
-    Ok(RespValue::Integer(res.len() as i64))
+    let removed = res.len() as i64;
+    if removed > 0 {
+        keys::cleanup_expiry_if_empty(client, "pg_redis_lists", &key)?;
+    }
+
+    Ok(RespValue::Integer(removed))
 }
 
 /// `LTRIM key start stop`
@@ -361,6 +387,9 @@ pub fn cmd_ltrim(client: &mut SpiClient, args: &[Bytes]) -> SpiResult<RespValue>
     let Some(mut stop) = parse_i64(&args[3]) else {
         return Ok(RespValue::not_integer_err());
     };
+    if keys::purge_if_expired_non_string(client, &key)? {
+        return Ok(RespValue::ok());
+    }
 
     let len = client
         .select(
@@ -387,8 +416,9 @@ pub fn cmd_ltrim(client: &mut SpiClient, args: &[Bytes]) -> SpiResult<RespValue>
         client.update(
             "DELETE FROM pg_redis_lists WHERE key = $1",
             None,
-            Some(vec![(PgBuiltInOids::TEXTOID.oid(), key.into_datum())]),
+            Some(vec![(PgBuiltInOids::TEXTOID.oid(), key.clone().into_datum())]),
         )?;
+        keys::cleanup_expiry_if_empty(client, "pg_redis_lists", &key)?;
         return Ok(RespValue::ok());
     }
 
@@ -408,11 +438,12 @@ pub fn cmd_ltrim(client: &mut SpiClient, args: &[Bytes]) -> SpiResult<RespValue>
           AND NOT EXISTS (SELECT 1 FROM kept k WHERE k.key = l.key AND k.seq = l.seq)",
         None,
         Some(vec![
-            (PgBuiltInOids::TEXTOID.oid(), key.into_datum()),
+            (PgBuiltInOids::TEXTOID.oid(), key.clone().into_datum()),
             (PgBuiltInOids::INT8OID.oid(), start.into_datum()),
             (PgBuiltInOids::INT8OID.oid(), keep_count.into_datum()),
         ]),
     )?;
+    keys::cleanup_expiry_if_empty(client, "pg_redis_lists", &key)?;
 
     Ok(RespValue::ok())
 }
@@ -476,6 +507,13 @@ pub fn cmd_lpos(client: &SpiClient, args: &[Bytes]) -> SpiResult<RespValue> {
             }
             _ => return Ok(RespValue::syntax_err()),
         }
+    }
+
+    if keys::is_non_string_expired(client, &key)? {
+        return Ok(match count_opt {
+            None => RespValue::Null,
+            Some(_) => RespValue::Array(Vec::new()),
+        });
     }
 
     let table = client.select(
@@ -559,6 +597,11 @@ pub fn cmd_lmove(
     push_left: bool,
     mutated_keys: &mut Vec<String>,
 ) -> SpiResult<RespValue> {
+    if keys::purge_if_expired_non_string(client, src_key)? {
+        return Ok(RespValue::Null);
+    }
+    keys::purge_if_expired_non_string(client, dst_key)?;
+
     let order = if pop_left { "ASC" } else { "DESC" };
     let pop_sql = format!(
         "WITH popped AS ( \
@@ -581,6 +624,9 @@ pub fn cmd_lmove(
     }
 
     let val = table.first().get_one::<String>()?.unwrap_or_default();
+    if src_key != dst_key {
+        keys::cleanup_expiry_if_empty(client, "pg_redis_lists", src_key)?;
+    }
 
     let push_sql = if push_left {
         "INSERT INTO pg_redis_lists (key, seq, value) \
@@ -659,6 +705,9 @@ pub fn try_blpop_once(
     );
 
     for key in keys {
+        if keys::purge_if_expired_non_string(client, key)? {
+            continue;
+        }
         let table = client.update(
             &sql,
             None,
@@ -666,6 +715,7 @@ pub fn try_blpop_once(
         )?;
         if !table.is_empty() {
             let val = table.first().get_one::<String>()?.unwrap_or_default();
+            keys::cleanup_expiry_if_empty(client, "pg_redis_lists", key)?;
             return Ok(Some(RespValue::Array(vec![
                 RespValue::bulk(key.clone()),
                 RespValue::bulk(val),

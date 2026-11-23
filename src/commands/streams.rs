@@ -3,6 +3,7 @@ use pgrx::prelude::*;
 use pgrx::spi::{SpiClient, SpiResult};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::commands::keys;
 use crate::protocol::RespValue;
 
 fn as_str(b: &Bytes) -> String {
@@ -220,6 +221,7 @@ pub fn cmd_xadd(
         return Ok(RespValue::wrong_arity("xadd"));
     }
 
+    keys::purge_if_expired_non_string(client, &key)?;
     let last_id = get_last_stream_id(client, &key)?;
     if nomkstream && last_id.is_none() {
         return Ok(RespValue::Null);
@@ -316,7 +318,14 @@ pub fn cmd_xtrim(client: &mut SpiClient, args: &[Bytes]) -> SpiResult<RespValue>
         _ => return Ok(RespValue::syntax_err()),
     };
 
+    if keys::purge_if_expired_non_string(client, &key)? {
+        return Ok(RespValue::Integer(0));
+    }
+
     let deleted = apply_trim(client, &key, strategy)?;
+    if deleted > 0 {
+        keys::cleanup_expiry_if_empty(client, "pg_redis_streams", &key)?;
+    }
     Ok(RespValue::Integer(deleted))
 }
 
@@ -325,6 +334,9 @@ pub fn cmd_xlen(client: &SpiClient, args: &[Bytes]) -> SpiResult<RespValue> {
         return Ok(RespValue::wrong_arity("xlen"));
     }
     let key = as_str(&args[1]);
+    if keys::is_non_string_expired(client, &key)? {
+        return Ok(RespValue::Integer(0));
+    }
     let count = client
         .select(
             "SELECT COUNT(*)::BIGINT FROM pg_redis_streams WHERE key = $1",
@@ -342,6 +354,9 @@ pub fn cmd_xdel(client: &mut SpiClient, args: &[Bytes]) -> SpiResult<RespValue> 
         return Ok(RespValue::wrong_arity("xdel"));
     }
     let key = as_str(&args[1]);
+    if keys::purge_if_expired_non_string(client, &key)? {
+        return Ok(RespValue::Integer(0));
+    }
     let mut deleted: i64 = 0;
 
     for raw_id in &args[2..] {
@@ -359,6 +374,10 @@ pub fn cmd_xdel(client: &mut SpiClient, args: &[Bytes]) -> SpiResult<RespValue> 
             ]),
         )?;
         deleted += res.len() as i64;
+    }
+
+    if deleted > 0 {
+        keys::cleanup_expiry_if_empty(client, "pg_redis_streams", &key)?;
     }
 
     Ok(RespValue::Integer(deleted))
@@ -392,6 +411,10 @@ pub fn cmd_xrange(client: &SpiClient, args: &[Bytes], rev: bool) -> SpiResult<Re
         count_opt = Some(c.max(0));
     } else if args.len() != 4 {
         return Ok(RespValue::syntax_err());
+    }
+
+    if keys::is_non_string_expired(client, &key)? {
+        return Ok(RespValue::Array(Vec::new()));
     }
 
     let start_cmp = if start_inc { ">=" } else { ">" };
@@ -516,7 +539,11 @@ pub fn resolve_xread_ids(
     let mut resolved = Vec::with_capacity(streams.len());
     for (key, id_str) in streams {
         if id_str == "$" {
-            let (ms, seq) = get_last_stream_id(client, key)?.unwrap_or((0, 0));
+            let (ms, seq) = if keys::is_non_string_expired(client, key)? {
+                (0, 0)
+            } else {
+                get_last_stream_id(client, key)?.unwrap_or((0, 0))
+            };
             resolved.push((key.clone(), ms, seq));
         } else {
             let Some((ms, seq)) = parse_stream_id_exact(id_str) else {
@@ -550,6 +577,9 @@ pub fn execute_xread_resolved(
     let mut stream_results: Vec<RespValue> = Vec::new();
 
     for (key, after_ms, after_seq) in resolved {
+        if keys::is_non_string_expired(client, key)? {
+            continue;
+        }
         let table = client.select(
             &sql,
             None,

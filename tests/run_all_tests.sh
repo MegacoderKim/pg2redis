@@ -41,12 +41,17 @@ echo "============================================================"
 docker compose --profile test run --rm --build test-bullmq
 
 echo "============================================================"
-echo " 7. Running Node.js ioredis 5.11.1 Pub/Sub (Medusa 2.22.7 workflows)"
+echo " 7. Running Node.js ioredis 5.11.1 Pub/Sub & v0.4.0 suite"
 echo "============================================================"
 docker compose --profile test run --rm --build test-pubsub
 
 echo "============================================================"
-echo " 8. Running pgrx in-PostgreSQL tests (cargo pgrx test & run pg15)"
+echo " 8. Running v0.4.0 Security & Limits suite (AUTH, Lua, limits)"
+echo "============================================================"
+bash ./tests/test_v040_security.sh 15
+
+echo "============================================================"
+echo " 9. Running pgrx in-PostgreSQL tests (cargo pgrx test & run pg15)"
 echo "============================================================"
 docker build --target dev --build-arg PG_MAJOR=15 -f docker/Dockerfile -t pg_redis_core:dev-pg15 .
 docker run --rm pg_redis_core:dev-pg15 sh -c "

@@ -1,12 +1,13 @@
 # Supported Redis Commands
 
-`pg_redis_core` supports **90+ Redis commands** over both **RESP2** and **RESP3** (plus inline commands), covering Strings, Keys/Expiry, Hashes, Lists, Sorted Sets, Sets, Streams, **Pub/Sub** (`PUBLISH`/`SUBSCRIBE`/`UNSUBSCRIBE`/`PUBSUB`), Blocking Operations (`BZPOPMIN`, `XREAD BLOCK`), Embedded Lua 5.1 Scripting (`EVAL`/`EVALSHA`/`SCRIPT`), Transactions, and Driver Handshakes — verified on **PostgreSQL 15 & 16** for **BullMQ 5.13.0** and **Medusa 2.22.7 (`ioredis 5.11.1`)**.
+`pg_redis_core` supports **100+ Redis commands** over both **RESP2** and **RESP3** (plus inline commands), covering Strings (`GETEX`), Universal Keys/Expiry across all 6 data types (`EXPIRE`/`PEXPIRE` with `NX|XX|GT|LT`), Hashes (`HSCAN`), Lists, Sorted Sets (`ZSCAN`), Sets (`SSCAN`), Streams, **Pub/Sub** (`PUBLISH`/`SUBSCRIBE`/`UNSUBSCRIBE`/`PSUBSCRIBE`/`PUNSUBSCRIBE`/`PUBSUB`), Blocking Operations (`BZPOPMIN`, `XREAD BLOCK`), Sandboxed Lua 5.1 Scripting (`EVAL`/`EVALSHA`/`SCRIPT`), Transactions, `AUTH` (`requirepass`), and Multi-Client `CLIENT LIST`/`KILL` — verified on **PostgreSQL 15 & 16** for **BullMQ 5.13.0** and **Medusa 2.22.7 (`ioredis 5.11.1`)**.
 
 ## Strings
 
 | Command | Syntax | Notes |
 | --- | --- | --- |
 | `GET` | `GET key` | Binary-safe (`BYTEA`); served from L1 `moka` cache when hot |
+| `GETEX` | `GETEX key [EX s \| PX ms \| EXAT ts \| PXAT ts_ms \| PERSIST]` | Atomically reads value and updates or removes TTL (`connect-redis` rolling sessions) |
 | `SET` | `SET key value [EX s \| PX ms \| EXAT ts \| PXAT ts_ms \| KEEPTTL] [NX \| XX] [GET]` | Full Redis option matrix; write-through L1 update |
 | `SETEX` / `PSETEX` | `SETEX key seconds value` / `PSETEX key ms value` | Set value with relative TTL |
 | `SETNX` | `SETNX key value` | Set only if key does not exist (or expired) |
@@ -24,18 +25,19 @@
 
 | Command | Syntax | Notes |
 | --- | --- | --- |
-| `DEL` / `UNLINK` | `DEL key [key ...]` | Removes keys across all 4 catalog tables; invalidates L1 cache |
-| `EXISTS` | `EXISTS key [key ...]` | Checks active keys across all 4 catalog tables |
-| `EXPIRE` / `PEXPIRE` | `EXPIRE key seconds` / `PEXPIRE key ms` | Sets relative expiration on string keys |
-| `EXPIREAT` / `PEXPIREAT` | `EXPIREAT key unix_ts` / `PEXPIREAT key unix_ms` | Sets absolute expiration timestamp |
-| `TTL` / `PTTL` | `TTL key` / `PTTL key` | Returns remaining TTL, `-1` (no expiry), or `-2` (missing) |
-| `PERSIST` | `PERSIST key` | Removes expiration from key |
+| `DEL` / `UNLINK` | `DEL key [key ...]` | Removes keys across all 6 catalog tables + `pg_redis_key_expiry`; invalidates L1 cache |
+| `EXISTS` | `EXISTS key [key ...]` | Checks active (non-expired) keys across all 6 catalog tables |
+| `EXPIRE` / `PEXPIRE` | `EXPIRE key seconds [NX\|XX\|GT\|LT]` / `PEXPIRE key ms [...]` | Sets relative expiration on **any** key type (Strings, Hashes, Lists, ZSets, Sets, Streams) |
+| `EXPIREAT` / `PEXPIREAT` | `EXPIREAT key unix_ts [NX\|XX\|GT\|LT]` / `PEXPIREAT key unix_ms [...]` | Sets absolute expiration timestamp on any key type |
+| `EXPIRETIME` / `PEXPIRETIME` | `EXPIRETIME key` / `PEXPIRETIME key` | Returns absolute Unix expiry timestamp (s/ms), `-1` (persistent), or `-2` (missing) |
+| `TTL` / `PTTL` | `TTL key` / `PTTL key` | Returns remaining TTL for any key type, `-1` (no expiry), or `-2` (missing) |
+| `PERSIST` | `PERSIST key` | Removes expiration from any key type |
 | `TYPE` | `TYPE key` | Returns `string`, `hash`, `list`, `zset`, `set`, `stream`, or `none` |
-| `RENAME` | `RENAME key newkey` | Atomically renames key across all 6 catalog tables |
+| `RENAME` | `RENAME key newkey` | Atomically renames key (and its TTL) across all 6 catalog tables |
 | `KEYS` | `KEYS pattern` | Supports Redis glob patterns (`*`, `?`, `[abc]`, `[^a]`, `[a-z]`, `\x`) |
-| `SCAN` | `SCAN cursor [MATCH pattern] [COUNT count]` | Cursor-based key iteration |
+| `SCAN` | `SCAN cursor [MATCH pattern] [COUNT count] [TYPE type]` | Cursor-based key iteration with glob and type filtering |
 | `DBSIZE` | `DBSIZE` | Total count of active keys across all catalog tables |
-| `FLUSHDB` / `FLUSHALL` | `FLUSHDB` | Clears all 4 catalog tables and resets L1 cache |
+| `FLUSHDB` / `FLUSHALL` | `FLUSHDB` | Clears all catalog tables, expiry metadata, and L1 cache |
 
 ## Hashes
 
@@ -52,6 +54,7 @@
 | `HLEN` | `HLEN key` | Number of fields in hash |
 | `HKEYS` / `HVALS` | `HKEYS key` / `HVALS key` | Sorted list of field names / values |
 | `HINCRBY` / `HINCRBYFLOAT` | `HINCRBY key field delta` | Atomic integer or float hash field increment |
+| `HSCAN` | `HSCAN key cursor [MATCH pattern] [COUNT count] [NOVALUES]` | Cursor-based hash field iteration (used by BullMQ pagination & `ioredis`) |
 
 ## Lists
 
@@ -86,6 +89,7 @@
 | `ZRANK` / `ZREVRANK` | `ZRANK key member [WITHSCORE]` | 0-based ascending / descending rank |
 | `ZINCRBY` | `ZINCRBY key increment member` | Increments member score (inserts if absent) |
 | `ZCOUNT` | `ZCOUNT key min max` | Count of members within inclusive/exclusive score bounds |
+| `ZSCAN` | `ZSCAN key cursor [MATCH pattern] [COUNT count]` | Cursor-based sorted set iteration returning `[member, score, ...]` |
 
 ## Sets
 
@@ -97,6 +101,7 @@
 | `SISMEMBER` | `SISMEMBER key member` | Returns `1` if member exists, else `0` |
 | `SCARD` | `SCARD key` | Cardinality of set |
 | `SPOP` | `SPOP key [count]` | Atomically removes and returns member(s) |
+| `SSCAN` | `SSCAN key cursor [MATCH pattern] [COUNT count]` | Cursor-based set member iteration (used by BullMQ dependency pagination) |
 
 ## Streams
 
@@ -119,31 +124,34 @@
 | `SCRIPT EXISTS` | `SCRIPT EXISTS sha1 [sha1 ...]` | Checks which SHA1 digests are cached |
 | `SCRIPT FLUSH` | `SCRIPT FLUSH` | Clears the compiled Lua script cache |
 
-!!! info "Included Lua 5.1 Builtins (Exact Redis Sandbox Parity)"
-    Powered by vendored **Lua 5.1 (`mlua`)** inside the background worker with `KEYS`, `ARGV` (binary-safe), `redis.call`, `redis.pcall`, `redis.status_reply`, `redis.error_reply`, `redis.sha1hex`, `redis.log`, **`cjson`**, **`cmsgpack`**, and **`bit`**.
+!!! info "Sandboxed Lua 5.1 Builtins (Exact Redis Sandbox Parity)"
+    Powered by vendored **Lua 5.1 (`mlua`)** restricted to safe stdlibs (`table`, `string`, `math` — `os`, `io`, `package`, `debug`, `dofile`, `loadfile`, and `require` are disabled) with configurable `pg_redis.lua_time_limit_ms` timeout protection. Exposes `KEYS`, `ARGV` (binary-safe), `redis.call`, `redis.pcall`, `redis.status_reply`, `redis.error_reply`, `redis.sha1hex`, `redis.log`, **`cjson`**, **`cmsgpack`**, and **`bit`**.
 
-## Pub/Sub (Named Channels)
+## Pub/Sub (Named Channels & Glob Patterns)
 
 | Command | Syntax | Notes |
 | --- | --- | --- |
-| `PUBLISH` | `PUBLISH channel message` | Binary-safe, arbitrary payload size (no 8 KB PG `NOTIFY` limit); returns exact live subscriber count; works inside Lua & `MULTI`/`EXEC` |
+| `PUBLISH` | `PUBLISH channel message` | Binary-safe, arbitrary payload size (no 8 KB PG `NOTIFY` limit); delivers to matching named & pattern subscribers and returns total count; works inside Lua & `MULTI`/`EXEC` |
 | `SUBSCRIBE` | `SUBSCRIBE channel [channel ...]` | Emits `["subscribe", ch, total_count]` per channel (idempotent on duplicates); RESP3 Push (`>`) frames |
-| `UNSUBSCRIBE` | `UNSUBSCRIBE [channel ...]` | Unsubscribes specific channels or all channels (0 args) down to `0` (`["unsubscribe", null, 0]` if none) |
-| `PUBSUB` | `PUBSUB CHANNELS [pattern] \| NUMSUB [ch ...] \| NUMPAT` | Inspect active named channels and live subscriber counts |
+| `UNSUBSCRIBE` | `UNSUBSCRIBE [channel ...]` | Unsubscribes specific channels or all channels (0 args) down to remaining pattern count |
+| `PSUBSCRIBE` | `PSUBSCRIBE pattern [pattern ...]` | Glob-pattern subscriptions emitting `["pmessage", pattern, channel, payload]` on match |
+| `PUNSUBSCRIBE` | `PUNSUBSCRIBE [pattern ...]` | Unsubscribes specific patterns or all patterns (0 args) |
+| `PUBSUB` | `PUBSUB CHANNELS [pattern] \| NUMSUB [ch ...] \| NUMPAT` | Inspect active named channels, live subscriber counts, and active pattern subscriptions |
 
 !!! note "Pub/Sub Scope"
-    Named-channel Pub/Sub (`PUBLISH`, `SUBSCRIBE`, `UNSUBSCRIBE`, `PUBSUB`) runs in-process inside the background worker's Tokio `LocalSet` with zero SPI overhead and automatic cleanup on disconnect. Pattern (`PSUBSCRIBE`/`PUNSUBSCRIBE`) and sharded (`SSUBSCRIBE`/`SUNSUBSCRIBE`) Pub/Sub are not implemented.
+    Named-channel (`SUBSCRIBE`/`UNSUBSCRIBE`) and pattern (`PSUBSCRIBE`/`PUNSUBSCRIBE`) Pub/Sub run in-process inside the background worker's Tokio `LocalSet` over bounded queues (`pg_redis.pubsub_queue_size`) with zero SPI overhead and automatic cleanup on disconnect or slow-consumer overflow. Sharded Pub/Sub (`SSUBSCRIBE`/`SUNSUBSCRIBE`) is not implemented.
 
 ## Transactions & Server / Protocol
 
 | Command | Syntax | Notes |
 | --- | --- | --- |
 | `MULTI` / `EXEC` / `DISCARD` | `MULTI` ... `EXEC` | Atomic command queueing executed in a single SPI transaction |
-| `HELLO` | `HELLO [2\|3 [AUTH u p] [SETNAME name]]` | Dynamic RESP2 / RESP3 protocol negotiation |
+| `AUTH` | `AUTH [default] password` | Constant-time password verification against `pg_redis.requirepass` (`NOAUTH` / `WRONGPASS`) |
+| `HELLO` | `HELLO [2\|3 [AUTH u p] [SETNAME name]]` | Dynamic RESP2 / RESP3 protocol negotiation & inline authentication |
 | `PING` / `ECHO` | `PING [msg]` / `ECHO msg` | Resolved in memory without SPI overhead (returns `["pong", msg]` in RESP2 subscribed mode) |
-| `RESET` | `RESET` | Unsubscribes all channels, clears `MULTI` state, resets protocol to RESP2, returns `+RESET` |
-| `CLIENT` | `CLIENT SETINFO \| SETNAME \| GETNAME \| ID \| LIST \| INFO` | Full `go-redis/v9`, `redis-py`, `ioredis`, and `Jedis` handshake support |
-| `INFO` | `INFO [section]` | Reports `pg_redis_core` version, PG config, and L1 cache hit/miss stats |
+| `RESET` | `RESET` | Unsubscribes all channels/patterns, clears `MULTI` state, resets auth & protocol to RESP2, returns `+RESET` |
+| `CLIENT` | `CLIENT SETINFO \| SETNAME \| GETNAME \| ID \| LIST \| INFO \| KILL` | Full multi-connection registry (`LIST [TYPE ...] [ID ...]`, `KILL ID\|ADDR`) for BullMQ `getWorkers()`, `go-redis/v9`, `redis-py`, `ioredis`, and `Jedis` |
+| `INFO` | `INFO [section]` | Reports `pg_redis_core` version, connected clients/maxclients, PG config, and L1 cache hit/miss stats |
 | `COMMAND` | `COMMAND [COUNT \| DOCS \| LIST]` | `redis-cli` interactive startup compatibility |
-| `CONFIG GET` | `CONFIG GET pattern` | Returns basic server config keys |
-| `SELECT` / `AUTH` / `TIME` / `QUIT` | Standard Redis syntax | Session lifecycle commands |
+| `CONFIG GET` | `CONFIG GET pattern` | Returns basic server config keys (`maxclients`, `lua-time-limit`, `maxmemory-policy`, etc.) |
+| `SELECT` / `TIME` / `QUIT` | Standard Redis syntax | Session lifecycle commands |

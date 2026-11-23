@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { createRequire } from "node:module";
 import net from "node:net";
 import Redis from "ioredis";
-import { Queue, Worker, QueueEvents } from "bullmq";
+import { Queue, Worker, QueueEvents, FlowProducer } from "bullmq";
 
 const require = createRequire(import.meta.url);
 const ioredisPkg = require("ioredis/package.json");
@@ -159,7 +159,7 @@ async function runTests() {
   // -------------------------------------------------------------------------
   // Test 1: Exact Redis wire-level acks, counts, duplicate & 0-arg UNSUBSCRIBE
   // -------------------------------------------------------------------------
-  console.log("  [1/7] Wire-level SUBSCRIBE/UNSUBSCRIBE acks, counts & subscribed-mode enforcement...");
+  console.log("  [1/10] Wire-level SUBSCRIBE/UNSUBSCRIBE acks, counts & subscribed-mode enforcement...");
   {
     const raw = await RawRespClient.connect(REDIS_HOST, REDIS_PORT);
     try {
@@ -217,7 +217,7 @@ async function runTests() {
   // -------------------------------------------------------------------------
   // Test 2: ioredis 5.11.1 Medusa workflow events, multi-sub counts, multi-ch & unsub
   // -------------------------------------------------------------------------
-  console.log("  [2/7] ioredis 5.11.1 Medusa 2.22.7 workflow Pub/Sub flow & recipient counts...");
+  console.log("  [2/10] ioredis 5.11.1 Medusa 2.22.7 workflow Pub/Sub flow & recipient counts...");
   {
     const sub1 = new Redis({ host: REDIS_HOST, port: REDIS_PORT });
     const sub2 = new Redis({ host: REDIS_HOST, port: REDIS_PORT });
@@ -307,7 +307,7 @@ async function runTests() {
   // -------------------------------------------------------------------------
   // Test 3: Idle subscriber leaves BGWorker free for other clients & BullMQ 5.13.0
   // -------------------------------------------------------------------------
-  console.log("  [3/7] Idle subscriber concurrency alongside normal clients & BullMQ 5.13.0...");
+  console.log("  [3/10] Idle subscriber concurrency alongside normal clients & BullMQ 5.13.0...");
   {
     const idleSub = new Redis({ host: REDIS_HOST, port: REDIS_PORT });
     const otherClient = new Redis({ host: REDIS_HOST, port: REDIS_PORT });
@@ -364,7 +364,7 @@ async function runTests() {
   // -------------------------------------------------------------------------
   // Test 4: Disconnect cleanup + reconnect & auto-resubscribe
   // -------------------------------------------------------------------------
-  console.log("  [4/7] Abrupt disconnect cleanup & automatic reconnect/resubscribe...");
+  console.log("  [4/10] Abrupt disconnect cleanup & automatic reconnect/resubscribe...");
   {
     const pub = new Redis({ host: REDIS_HOST, port: REDIS_PORT });
     const subDrop = new Redis({ host: REDIS_HOST, port: REDIS_PORT, retryStrategy: null });
@@ -415,7 +415,7 @@ async function runTests() {
   // -------------------------------------------------------------------------
   // Test 5: Strict message ordering (100 sequential messages)
   // -------------------------------------------------------------------------
-  console.log("  [5/7] Strict FIFO message ordering (100 messages)...");
+  console.log("  [5/10] Strict FIFO message ordering (100 messages)...");
   {
     const sub = new Redis({ host: REDIS_HOST, port: REDIS_PORT });
     const pub = new Redis({ host: REDIS_HOST, port: REDIS_PORT });
@@ -465,7 +465,7 @@ async function runTests() {
   // -------------------------------------------------------------------------
   // Test 6: Binary-safe payloads AND large payload (> 8KB PG NOTIFY limit)
   // -------------------------------------------------------------------------
-  console.log("  [6/7] Binary-safe payloads & large 32KB+ payload (> PG NOTIFY 8KB limit)...");
+  console.log("  [6/10] Binary-safe payloads & large 32KB+ payload (> PG NOTIFY 8KB limit)...");
   {
     const sub = new Redis({ host: REDIS_HOST, port: REDIS_PORT });
     const pub = new Redis({ host: REDIS_HOST, port: REDIS_PORT });
@@ -512,7 +512,7 @@ async function runTests() {
   // -------------------------------------------------------------------------
   // Test 7: PUBLISH from Lua (`redis.call('PUBLISH', ...)`) and MULTI/EXEC
   // -------------------------------------------------------------------------
-  console.log("  [7/7] PUBLISH from Lua script and MULTI/EXEC transaction...");
+  console.log("  [7/10] PUBLISH from Lua script and MULTI/EXEC transaction...");
   {
     const sub = new Redis({ host: REDIS_HOST, port: REDIS_PORT });
     const pub = new Redis({ host: REDIS_HOST, port: REDIS_PORT });
@@ -548,7 +548,308 @@ async function runTests() {
   }
   console.log("        PASS");
 
-  console.log("==> ALL 7 PUB/SUB INTEGRATION TESTS PASSED!");
+  // -------------------------------------------------------------------------
+  // Test 8: Pattern Pub/Sub (PSUBSCRIBE / PUNSUBSCRIBE / pmessage / NUMPAT)
+  // -------------------------------------------------------------------------
+  console.log("  [8/10] Pattern Pub/Sub (PSUBSCRIBE, PUNSUBSCRIBE, pmessage, PUBSUB NUMPAT)...");
+  {
+    const psub = new Redis({ host: REDIS_HOST, port: REDIS_PORT });
+    const pub = new Redis({ host: REDIS_HOST, port: REDIS_PORT });
+    const raw = await RawRespClient.connect(REDIS_HOST, REDIS_PORT);
+    try {
+      // Wire-level PSUBSCRIBE + mixed SUBSCRIBE count + idempotent duplicate
+      raw.send("PSUBSCRIBE", "orders.*", "orders.*", "billing:*");
+      assert.deepEqual(await raw.nextFrame(), ["psubscribe", "orders.*", { type: ":", value: 1 }]);
+      assert.deepEqual(await raw.nextFrame(), ["psubscribe", "orders.*", { type: ":", value: 1 }]);
+      assert.deepEqual(await raw.nextFrame(), ["psubscribe", "billing:*", { type: ":", value: 2 }]);
+
+      raw.send("SUBSCRIBE", "orders.created");
+      assert.deepEqual(await raw.nextFrame(), ["subscribe", "orders.created", { type: ":", value: 3 }]);
+
+      // ioredis psubscribe alongside raw pattern subscriber
+      const pCount = await psub.psubscribe("orders.*");
+      assert.equal(pCount, 1);
+
+      const numpat = await pub.pubsub("NUMPAT");
+      assert.equal(numpat, 3); // raw (2 patterns) + psub (1 pattern)
+
+      const pmsgPromise = new Promise((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error("Timed out waiting for pmessage")), 5000);
+        psub.once("pmessage", (pattern, channel, message) => {
+          clearTimeout(timer);
+          resolve({ pattern, channel, message });
+        });
+      });
+
+      // Publish matches raw's channel + raw's pattern + psub's pattern = 3 deliveries
+      const delivered = await pub.publish("orders.created", '{"id":"ord_99"}');
+      assert.equal(delivered, 3);
+
+      const pmsg = await pmsgPromise;
+      assert.deepEqual(pmsg, {
+        pattern: "orders.*",
+        channel: "orders.created",
+        message: '{"id":"ord_99"}',
+      });
+
+      const rawFrames = [await raw.nextFrame(), await raw.nextFrame()];
+      assert.ok(
+        rawFrames.some((f) => f[0] === "message" && f[1] === "orders.created" && f[2] === '{"id":"ord_99"}')
+      );
+      assert.ok(
+        rawFrames.some(
+          (f) => f[0] === "pmessage" && f[1] === "orders.*" && f[2] === "orders.created" && f[3] === '{"id":"ord_99"}'
+        )
+      );
+
+      // Zero-arg UNSUBSCRIBE leaves pattern count intact, then zero-arg PUNSUBSCRIBE drops to 0
+      raw.send("UNSUBSCRIBE");
+      assert.deepEqual(await raw.nextFrame(), ["unsubscribe", "orders.created", { type: ":", value: 2 }]);
+      raw.send("PUNSUBSCRIBE");
+      assert.deepEqual(await raw.nextFrame(), ["punsubscribe", "orders.*", { type: ":", value: 1 }]);
+      assert.deepEqual(await raw.nextFrame(), ["punsubscribe", "billing:*", { type: ":", value: 0 }]);
+
+      // Normal command works again after leaving subscribed mode
+      raw.send("PING");
+      assert.deepEqual(await raw.nextFrame(), { type: "+", value: "PONG" });
+
+      await psub.punsubscribe("orders.*");
+      assert.equal(await pub.pubsub("NUMPAT"), 0);
+    } finally {
+      raw.close();
+      psub.disconnect();
+      pub.disconnect();
+    }
+  }
+  console.log("        PASS");
+
+  // -------------------------------------------------------------------------
+  // Test 9: Universal Key TTL (Hash/List/Set/ZSet/Stream), NX/XX/GT/LT & GETEX
+  // -------------------------------------------------------------------------
+  console.log("  [9/10] Universal TTL across all 6 data types, NX/XX/GT/LT flags & GETEX...");
+  {
+    const r = new Redis({ host: REDIS_HOST, port: REDIS_PORT });
+    try {
+      await r.del("ttl:h", "ttl:h2", "ttl:l", "ttl:s", "ttl:z", "ttl:x", "ttl:str");
+
+      await r.hset("ttl:h", "f1", "v1", "f2", "v2");
+      await r.rpush("ttl:l", "a", "b");
+      await r.sadd("ttl:s", "m1", "m2");
+      await r.zadd("ttl:z", 10, "z1", 20, "z2");
+      await r.xadd("ttl:x", "*", "ev", "created");
+
+      // Set TTL on every non-string type
+      for (const k of ["ttl:h", "ttl:l", "ttl:s", "ttl:z", "ttl:x"]) {
+        assert.equal(await r.pexpire(k, 300), 1, `PEXPIRE should succeed on ${k}`);
+        const pttl = await r.pttl(k);
+        assert.ok(pttl > 0 && pttl <= 350, `Unexpected PTTL ${pttl} on ${k}`);
+        const pexptime = await r.call("PEXPIRETIME", k);
+        assert.ok(Number(pexptime) > Date.now() - 1000);
+      }
+
+      // Wait for all 5 non-string keys to expire lazily
+      await sleep(380);
+      assert.equal(await r.exists("ttl:h", "ttl:l", "ttl:s", "ttl:z", "ttl:x"), 0);
+      assert.deepEqual(await r.hgetall("ttl:h"), {});
+      assert.deepEqual(await r.lrange("ttl:l", 0, -1), []);
+      assert.deepEqual(await r.smembers("ttl:s"), []);
+      assert.deepEqual(await r.zrange("ttl:z", 0, -1), []);
+      assert.deepEqual(await r.xrange("ttl:x", "-", "+"), []);
+      assert.equal(await r.ttl("ttl:h"), -2);
+      assert.equal(await r.type("ttl:h"), "none");
+
+      // Re-creating expired hash starts persistent (TTL = -1)
+      await r.hset("ttl:h", "fresh", "1");
+      assert.equal(await r.ttl("ttl:h"), -1);
+
+      // EXPIRE NX / XX / GT / LT flags on Hash
+      assert.equal(await r.call("EXPIRE", "ttl:h", "60", "XX"), 0);
+      assert.equal(await r.call("EXPIRE", "ttl:h", "60", "GT"), 0); // infinity > 60
+      assert.equal(await r.call("EXPIRE", "ttl:h", "60", "NX"), 1);
+      assert.equal(await r.call("EXPIRE", "ttl:h", "30", "NX"), 0);
+      assert.equal(await r.call("EXPIRE", "ttl:h", "30", "GT"), 0);
+      assert.equal(await r.call("EXPIRE", "ttl:h", "120", "GT"), 1);
+      assert.equal(await r.call("EXPIRE", "ttl:h", "200", "LT"), 0);
+      assert.equal(await r.call("EXPIRE", "ttl:h", "50", "LT"), 1);
+
+      // RENAME preserves Hash TTL
+      await r.rename("ttl:h", "ttl:h2");
+      const renamedTtl = await r.ttl("ttl:h2");
+      assert.ok(renamedTtl > 0 && renamedTtl <= 50, `Expected preserved TTL, got ${renamedTtl}`);
+
+      // Emptying a hash clears its expiry metadata
+      await r.hdel("ttl:h2", "fresh");
+      await r.hset("ttl:h2", "reborn", "yes");
+      assert.equal(await r.ttl("ttl:h2"), -1);
+
+      // PERSIST on hash
+      await r.expire("ttl:h2", 60);
+      assert.equal(await r.persist("ttl:h2"), 1);
+      assert.equal(await r.ttl("ttl:h2"), -1);
+
+      // GETEX (rolling session TTL)
+      await r.set("ttl:str", "session_abc");
+      assert.equal(await r.call("GETEX", "ttl:str", "EX", "45"), "session_abc");
+      const strTtl = await r.ttl("ttl:str");
+      assert.ok(strTtl > 0 && strTtl <= 45);
+      assert.equal(await r.call("GETEX", "ttl:str", "PERSIST"), "session_abc");
+      assert.equal(await r.ttl("ttl:str"), -1);
+    } finally {
+      r.disconnect();
+    }
+  }
+  console.log("        PASS");
+
+  // -------------------------------------------------------------------------
+  // Test 10: HSCAN/SSCAN/ZSCAN, SCAN TYPE, CLIENT LIST/KILL, Lua Sandbox & BullMQ FlowProducer
+  // -------------------------------------------------------------------------
+  console.log("  [10/10] HSCAN/SSCAN/ZSCAN, SCAN TYPE, CLIENT LIST/KILL, Lua Sandbox & BullMQ Flow...");
+  {
+    const r1 = new Redis({ host: REDIS_HOST, port: REDIS_PORT });
+    const r2 = new Redis({ host: REDIS_HOST, port: REDIS_PORT });
+    try {
+      await r1.flushdb();
+
+      // Lua sandbox: dangerous stdlibs & file loaders must be nil
+      const sandboxCheck = JSON.parse(
+        await r1.eval(
+          "return cjson.encode({os=type(os),io=type(io),pkg=type(package),dbg=type(debug),dofile=type(dofile),loadfile=type(loadfile),req=type(require)})",
+          0
+        )
+      );
+      assert.deepEqual(sandboxCheck, {
+        os: "nil",
+        io: "nil",
+        pkg: "nil",
+        dbg: "nil",
+        dofile: "nil",
+        loadfile: "nil",
+        req: "nil",
+      });
+
+      // HSCAN pagination + MATCH + NOVALUES
+      for (let i = 0; i < 15; i++) {
+        await r1.hset("scan:hash", `field_${String(i).padStart(2, "0")}`, `val_${i}`);
+      }
+      let cursor = "0";
+      const hEntries = {};
+      do {
+        const [next, items] = await r1.hscan("scan:hash", cursor, "MATCH", "field_*", "COUNT", 4);
+        cursor = next;
+        for (let i = 0; i < items.length; i += 2) {
+          hEntries[items[i]] = items[i + 1];
+        }
+      } while (cursor !== "0");
+      assert.equal(Object.keys(hEntries).length, 15);
+      assert.equal(hEntries.field_07, "val_7");
+
+      const [, noValFields] = await r1.call("HSCAN", "scan:hash", "0", "COUNT", "50", "NOVALUES");
+      assert.equal(noValFields.length, 15);
+
+      // SSCAN pagination
+      for (let i = 0; i < 12; i++) {
+        await r1.sadd("scan:set", `member_${String(i).padStart(2, "0")}`);
+      }
+      cursor = "0";
+      const sMembers = [];
+      do {
+        const [next, items] = await r1.sscan("scan:set", cursor, "MATCH", "member_*", "COUNT", 5);
+        cursor = next;
+        sMembers.push(...items);
+      } while (cursor !== "0");
+      assert.equal(sMembers.length, 12);
+
+      // ZSCAN pagination
+      for (let i = 0; i < 10; i++) {
+        await r1.zadd("scan:zset", i * 1.5, `zm_${i}`);
+      }
+      cursor = "0";
+      const zMap = {};
+      do {
+        const [next, items] = await r1.zscan("scan:zset", cursor, "MATCH", "zm_*", "COUNT", 3);
+        cursor = next;
+        for (let i = 0; i < items.length; i += 2) {
+          zMap[items[i]] = Number(items[i + 1]);
+        }
+      } while (cursor !== "0");
+      assert.equal(Object.keys(zMap).length, 10);
+      assert.equal(zMap.zm_4, 6);
+
+      // SCAN ... TYPE filter
+      await r1.set("scan:str", "ok");
+      const [, onlyHashes] = await r1.scan("0", "MATCH", "scan:*", "COUNT", 100, "TYPE", "hash");
+      assert.deepEqual(onlyHashes, ["scan:hash"]);
+      const [, onlySets] = await r1.scan("0", "MATCH", "scan:*", "COUNT", 100, "TYPE", "set");
+      assert.deepEqual(onlySets, ["scan:set"]);
+      const [, onlyZsets] = await r1.scan("0", "MATCH", "scan:*", "COUNT", 100, "TYPE", "zset");
+      assert.deepEqual(onlyZsets, ["scan:zset"]);
+
+      // Multi-connection CLIENT LIST, INFO clients & CLIENT KILL
+      await r1.client("SETNAME", "medusa-api-1");
+      await r2.client("SETNAME", "medusa-worker-2");
+      const r2Id = await r2.client("ID");
+      const clientList = await r1.client("LIST");
+      assert.ok(clientList.includes("name=medusa-api-1"), `Missing r1 in CLIENT LIST: ${clientList}`);
+      assert.ok(clientList.includes("name=medusa-worker-2"), `Missing r2 in CLIENT LIST: ${clientList}`);
+      const info = await r1.info();
+      assert.match(info, /connected_clients:[2-9]\d*/);
+
+      const killed = await r1.call("CLIENT", "KILL", "ID", String(r2Id));
+      assert.equal(killed, 1);
+
+      // Real BullMQ FlowProducer + job.getDependencies() (exercises paginate-1.lua SSCAN/HSCAN)
+      // + queue.getWorkers() (exercises multi-client CLIENT LIST!)
+      const flowQueueName = "v040-flow-q";
+      const bullConn = { host: REDIS_HOST, port: REDIS_PORT, maxRetriesPerRequest: null };
+      const flowQueue = new Queue(flowQueueName, { connection: bullConn });
+      const flowProducer = new FlowProducer({ connection: bullConn });
+      const flowWorker = new Worker(
+        flowQueueName,
+        async (job) => ({ ok: true, name: job.name }),
+        { connection: bullConn, name: "v040-worker" }
+      );
+      try {
+        await flowWorker.waitUntilReady();
+        const workers = await flowQueue.getWorkers();
+        assert.ok(
+          workers.length >= 1,
+          `Expected queue.getWorkers() >= 1 via CLIENT LIST, got ${JSON.stringify(workers)}`
+        );
+
+        const tree = await flowProducer.add({
+          name: "parent-order",
+          queueName: flowQueueName,
+          data: { orderId: "ord_flow_1" },
+          children: [
+            { name: "child-inventory", queueName: flowQueueName, data: { step: 1 } },
+            { name: "child-invoice", queueName: flowQueueName, data: { step: 2 } },
+          ],
+        });
+
+        // Poll until parent finishes (children complete first)
+        for (let i = 0; i < 40; i++) {
+          const state = await tree.job.getState();
+          if (state === "completed") break;
+          await sleep(100);
+        }
+        assert.equal(await tree.job.getState(), "completed");
+
+        // getDependencies() invokes BullMQ paginate-1.lua (HSCAN/SSCAN)!
+        const deps = await tree.job.getDependencies();
+        assert.equal(Object.keys(deps.processed || {}).length, 2);
+      } finally {
+        await flowWorker.close();
+        await flowProducer.close();
+        await flowQueue.close();
+      }
+    } finally {
+      r1.disconnect();
+      r2.disconnect();
+    }
+  }
+  console.log("        PASS");
+
+  console.log("==> ALL 10 PUB/SUB & V0.4.0 INTEGRATION TESTS PASSED!");
 }
 
 runTests().catch((err) => {

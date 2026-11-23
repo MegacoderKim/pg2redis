@@ -12,9 +12,9 @@
 ## Architecture
 
 - **Embedded RESP Listener (`src/worker.rs`, `src/protocol.rs`):** A PostgreSQL background worker runs a single-threaded Tokio (`current_thread` + `LocalSet`) TCP server on `0.0.0.0:6379` with zero-copy `redis-protocol` 6.0 frame parsing, RESP2 & RESP3 (`HELLO 3`) negotiation, and inline command support.
-- **In-Process Redis Pub/Sub (`src/pubsub.rs`):** Named-channel `PUBLISH`, `SUBSCRIBE`, `UNSUBSCRIBE`, and `PUBSUB` (`CHANNELS`/`NUMSUB`/`NUMPAT`) with exact Redis acknowledgements, binary-safe payloads beyond PostgreSQL's 8 KB `NOTIFY` limit, strict FIFO ordering, non-blocking idle subscribers, and automatic RAII cleanup on disconnect — verified end-to-end with **`ioredis@5.11.1`** (Medusa 2.22.7 workflow notifications).
-- **Embedded Lua 5.1 Scripting (`src/lua.rs`):** Vendored Lua 5.1 via `mlua` supporting `EVAL`, `EVALSHA`, `SCRIPT LOAD/EXISTS/FLUSH`, `cjson`, `cmsgpack`, `bit`, and atomic `redis.call`/`pcall` execution inside PostgreSQL SPI transactions.
-- **Streams, Sets & Cooperative Blocking (`src/commands/streams.rs`, `src/commands/sets.rs`, `src/notify.rs`):** Full `XADD`, `XTRIM`, `XREAD [BLOCK]`, `XRANGE`, `XLEN`, `BZPOPMIN`, `BZPOPMAX`, `BLPOP`, `BRPOP`, `ZPOPMIN`, `SADD`/`SMEMBERS` — verified end-to-end with **BullMQ 5.13.0** (Medusa queues) on both **PostgreSQL 15** and **PostgreSQL 16**.
+- **In-Process Redis Pub/Sub (`src/pubsub.rs`):** Named-channel and glob-pattern `PUBLISH`, `SUBSCRIBE`, `UNSUBSCRIBE`, `PSUBSCRIBE`, `PUNSUBSCRIBE`, and `PUBSUB` (`CHANNELS`/`NUMSUB`/`NUMPAT`) with exact Redis acknowledgements, binary-safe payloads beyond PostgreSQL's 8 KB `NOTIFY` limit, bounded slow-consumer queues, strict FIFO ordering, non-blocking idle subscribers, and automatic RAII cleanup on disconnect — verified end-to-end with **`ioredis@5.11.1`** (Medusa 2.22.7 workflow notifications).
+- **Sandboxed Lua 5.1 Scripting (`src/lua.rs`):** Vendored Lua 5.1 via `mlua` restricted to safe stdlibs (`table`/`string`/`math`, no `os`/`io`/`package`/`debug`) with configurable execution timeouts (`pg_redis.lua_time_limit_ms`), supporting `EVAL`, `EVALSHA`, `SCRIPT LOAD/EXISTS/FLUSH`, `cjson`, `cmsgpack`, `bit`, and atomic `redis.call`/`pcall` execution inside PostgreSQL SPI transactions.
+- **Streams, Sets, Universal TTL & Scans (`src/commands/`):** Full `XADD`/`XREAD [BLOCK]`/`XRANGE`, `BZPOPMIN`/`BLPOP`, universal `EXPIRE`/`PEXPIRE` (`NX|XX|GT|LT`) across all 6 data types (`pg_redis_key_expiry`), `HSCAN`/`SSCAN`/`ZSCAN`/`SCAN TYPE`, `GETEX`, and multi-client `CLIENT LIST`/`KILL` — verified end-to-end with **BullMQ 5.13.0** (Medusa queues) on both **PostgreSQL 15** and **PostgreSQL 16**.
 - **Pipelining & Frame Batching (`src/commands/mod.rs`):** Multiple pipelined frames arriving over a socket are batched into a single PostgreSQL SPI transaction. Full `MULTI` / `EXEC` / `DISCARD` transactions are also supported.
 - **Prepared SPI Plans (`src/storage.rs`):** High-frequency queries (`GET`, `SET`, `HGET`, `HSET`, `HGETALL`, `ZSCORE`, TTL eviction) are pre-prepared and retained across transactions via `SPI_keepplan`.
 - **In-Process L1 Hot-Key Cache (`src/cache.rs`):** Backed by `moka::sync::Cache`, serving hot string `GET` hits directly from worker memory with exact TTL awareness and immediate write-through invalidation.
@@ -27,10 +27,13 @@
 
 | Table | Purpose | Primary Key |
 | --- | --- | --- |
-| `pg_redis_strings` | `GET`, `SET`, `INCR`, `DECR`, `EXPIRE`, `TTL`, `DEL` | `(key)` |
-| `pg_redis_hashes` | `HSET`, `HGET`, `HMGET`, `HGETALL`, `HDEL`, `HINCRBY` | `(key, field)` |
-| `pg_redis_lists` | `LPUSH`, `RPUSH`, `LPOP`, `RPOP`, `LRANGE`, `LLEN`, `LINDEX`, `LSET`, `LREM` | `(key, seq)` |
-| `pg_redis_zsets` | `ZADD`, `ZRANGE`, `ZREVRANGE`, `ZRANGEBYSCORE`, `ZREM`, `ZSCORE`, `ZRANK`, `ZINCRBY`, `ZCOUNT` | `(key, member)` |
+| `pg_redis_strings` | `GET`, `GETEX`, `SET`, `INCR`, `DECR`, `EXPIRE`, `TTL`, `DEL` | `(key)` |
+| `pg_redis_hashes` | `HSET`, `HGET`, `HMGET`, `HGETALL`, `HDEL`, `HINCRBY`, `HSCAN` | `(key, field)` |
+| `pg_redis_lists` | `LPUSH`, `RPUSH`, `LPOP`, `RPOP`, `LRANGE`, `LLEN`, `LINDEX`, `LSET`, `LREM`, `LTRIM`, `LPOS`, `LMOVE` | `(key, seq)` |
+| `pg_redis_zsets` | `ZADD`, `ZRANGE`, `ZRANGEBYSCORE`, `ZREM`, `ZPOPMIN`, `BZPOPMIN`, `ZSCORE`, `ZRANK`, `ZSCAN` | `(key, member)` |
+| `pg_redis_sets` | `SADD`, `SREM`, `SMEMBERS`, `SISMEMBER`, `SCARD`, `SPOP`, `SSCAN` | `(key, member)` |
+| `pg_redis_streams` | `XADD`, `XTRIM`, `XREAD [BLOCK]`, `XRANGE`, `XREVRANGE`, `XLEN`, `XDEL` | `(key, ms, seq)` |
+| `pg_redis_key_expiry` | Universal TTL expiration (`EXPIRE`/`PEXPIRE`/`TTL`/`PERSIST`) for non-string keys | `(key)` |
 
 ## Quick Start (Docker)
 
@@ -71,6 +74,11 @@ Runs raw TCP RESP tests, Python (`FastAPI` + `redis-py` + `psycopg`), Go (`go-re
 | `pg_redis.cache_capacity` | `10000` | Maximum L1 cache entries |
 | `pg_redis.cache_ttl_ms` | `500` | Max L1 cache entry revalidation window (ms) |
 | `pg_redis.eviction_interval_ms` | `5000` | Interval between `ctid`-batched TTL eviction runs (ms) |
+| `pg_redis.requirepass` | *(unset)* | Optional password enforced on `AUTH` / `HELLO ... AUTH` (`SUPERUSER_ONLY`) |
+| `pg_redis.lua_time_limit_ms` | `5000` | Max execution time per Lua `EVAL`/`EVALSHA` script in ms (`0` disables) |
+| `pg_redis.max_clients` | `1000` | Max concurrent RESP TCP connections |
+| `pg_redis.max_frame_bytes` | `67108864` | Max buffered RESP request bytes per connection (64 MiB) |
+| `pg_redis.pubsub_queue_size` | `4096` | Bounded per-subscriber Pub/Sub message queue capacity |
 
 ## SQL Functions
 

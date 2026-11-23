@@ -13,6 +13,8 @@ use pgrx::spi::{Spi, SpiClient, SpiResult};
 use std::panic::AssertUnwindSafe;
 
 use crate::cache::L1Cache;
+use crate::clients::ClientRegistry;
+use crate::config;
 use crate::lua::LuaEngine;
 use crate::notify::KeyNotifier;
 use crate::protocol::{RespValue, RespVersion};
@@ -24,6 +26,7 @@ pub struct ConnectionState {
     pub protocol: RespVersion,
     pub client_name: Option<String>,
     pub selected_db: i64,
+    pub authenticated: bool,
     pub in_multi: bool,
     pub multi_queue: Vec<Vec<Bytes>>,
     pub should_quit: bool,
@@ -36,6 +39,7 @@ impl ConnectionState {
             protocol: RespVersion::Resp2,
             client_name: None,
             selected_db: 0,
+            authenticated: config::requirepass().is_none(),
             in_multi: false,
             multi_queue: Vec::new(),
             should_quit: false,
@@ -163,10 +167,11 @@ fn handle_unsubscribe_cmd(
     if args.len() == 1 {
         let removed = hub.unsubscribe_all(conn.client_id);
         if removed.is_empty() {
+            let remaining = hub.subscription_count(conn.client_id) as i64;
             return vec![RespValue::Push(vec![
                 RespValue::bulk("unsubscribe"),
                 RespValue::Null,
-                RespValue::Integer(0),
+                RespValue::Integer(remaining),
             ])];
         }
         return removed
@@ -187,6 +192,71 @@ fn handle_unsubscribe_cmd(
         acks.push(RespValue::Push(vec![
             RespValue::bulk("unsubscribe"),
             RespValue::BulkString(ch.clone()),
+            RespValue::Integer(remaining),
+        ]));
+    }
+    acks
+}
+
+fn handle_psubscribe_cmd(
+    pubsub: Option<&PubSubHub>,
+    conn: &ConnectionState,
+    args: &[Bytes],
+) -> Vec<RespValue> {
+    if args.len() < 2 {
+        return vec![RespValue::wrong_arity("psubscribe")];
+    }
+    let Some(hub) = pubsub else {
+        return vec![RespValue::err("ERR Pub/Sub is unavailable in this session")];
+    };
+    let mut acks = Vec::with_capacity(args.len() - 1);
+    for pat in &args[1..] {
+        let count = hub.psubscribe(conn.client_id, pat.clone()) as i64;
+        acks.push(RespValue::Push(vec![
+            RespValue::bulk("psubscribe"),
+            RespValue::BulkString(pat.clone()),
+            RespValue::Integer(count),
+        ]));
+    }
+    acks
+}
+
+fn handle_punsubscribe_cmd(
+    pubsub: Option<&PubSubHub>,
+    conn: &ConnectionState,
+    args: &[Bytes],
+) -> Vec<RespValue> {
+    let Some(hub) = pubsub else {
+        return vec![RespValue::err("ERR Pub/Sub is unavailable in this session")];
+    };
+    if args.len() == 1 {
+        let removed = hub.punsubscribe_all(conn.client_id);
+        if removed.is_empty() {
+            let remaining = hub.subscription_count(conn.client_id) as i64;
+            return vec![RespValue::Push(vec![
+                RespValue::bulk("punsubscribe"),
+                RespValue::Null,
+                RespValue::Integer(remaining),
+            ])];
+        }
+        return removed
+            .into_iter()
+            .map(|(pat, remaining)| {
+                RespValue::Push(vec![
+                    RespValue::bulk("punsubscribe"),
+                    RespValue::BulkString(pat),
+                    RespValue::Integer(remaining as i64),
+                ])
+            })
+            .collect();
+    }
+
+    let mut acks = Vec::with_capacity(args.len() - 1);
+    for pat in &args[1..] {
+        let remaining = hub.punsubscribe(conn.client_id, pat) as i64;
+        acks.push(RespValue::Push(vec![
+            RespValue::bulk("punsubscribe"),
+            RespValue::BulkString(pat.clone()),
             RespValue::Integer(remaining),
         ]));
     }
@@ -232,22 +302,32 @@ fn handle_pubsub_cmd(pubsub: Option<&PubSubHub>, args: &[Bytes]) -> RespValue {
             }
             RespValue::Array(out)
         }
-        "NUMPAT" => RespValue::Integer(0),
+        "NUMPAT" => RespValue::Integer(pubsub.map(PubSubHub::numpat).unwrap_or(0)),
         _ => RespValue::err(format!(
             "ERR Unknown subcommand or wrong number of arguments for '{sub}'. Try PUBSUB HELP."
         )),
     }
 }
 
-fn handle_reset_cmd(pubsub: Option<&PubSubHub>, conn: &mut ConnectionState) -> RespValue {
+fn handle_reset_cmd(
+    pubsub: Option<&PubSubHub>,
+    clients: Option<&ClientRegistry>,
+    conn: &mut ConnectionState,
+) -> RespValue {
     if let Some(hub) = pubsub {
-        hub.unsubscribe_all(conn.client_id);
+        hub.unsubscribe_everything(conn.client_id);
     }
     conn.in_multi = false;
     conn.multi_queue.clear();
     conn.protocol = RespVersion::Resp2;
     conn.client_name = None;
     conn.selected_db = 0;
+    conn.authenticated = config::requirepass().is_none();
+    if let Some(reg) = clients {
+        reg.set_name(conn.client_id, None);
+        reg.set_db(conn.client_id, 0);
+        reg.set_proto(conn.client_id, RespVersion::Resp2);
+    }
     RespValue::SimpleString(Bytes::from_static(b"RESET"))
 }
 
@@ -264,15 +344,33 @@ fn handle_subscribed_ping(conn: &ConnectionState, args: &[Bytes]) -> RespValue {
 }
 
 /// Try to handle a command purely in memory without opening a PostgreSQL SPI transaction.
-/// Returns `Some(Vec<RespValue>)` because `SUBSCRIBE` / `UNSUBSCRIBE` can emit multiple frames.
+/// Returns `Some(Vec<RespValue>)` because `SUBSCRIBE` / `UNSUBSCRIBE` / `PSUBSCRIBE` / `PUNSUBSCRIBE`
+/// can emit multiple frames.
 fn try_execute_in_memory_multi(
     args: &[Bytes],
     conn: &mut ConnectionState,
     cache: Option<&L1Cache>,
     lua: Option<&LuaEngine>,
     pubsub: Option<&PubSubHub>,
+    clients: Option<&ClientRegistry>,
 ) -> Option<Vec<RespValue>> {
     let cmd = cmd_name_upper(args);
+
+    // Enforce `pg_redis.requirepass` authentication gate before any other command.
+    if config::requirepass().is_some() && !conn.authenticated {
+        return Some(match cmd.as_str() {
+            "AUTH" => vec![server::cmd_auth(conn, args)],
+            "HELLO" => vec![server::cmd_hello(conn, clients, args)],
+            "QUIT" => {
+                if let Some(hub) = pubsub {
+                    hub.unsubscribe_everything(conn.client_id);
+                }
+                vec![server::cmd_quit(conn)]
+            }
+            "RESET" => vec![handle_reset_cmd(pubsub, clients, conn)],
+            _ => vec![RespValue::err("NOAUTH Authentication required.")],
+        });
+    }
 
     // Enforce Redis RESP2 subscribed-mode restrictions (ioredis uses RESP2 by default).
     // In RESP3, push frames (`>`) allow normal commands alongside subscriptions.
@@ -285,14 +383,16 @@ fn try_execute_in_memory_multi(
         return Some(match cmd.as_str() {
             "SUBSCRIBE" => handle_subscribe_cmd(pubsub, conn, args),
             "UNSUBSCRIBE" => handle_unsubscribe_cmd(pubsub, conn, args),
+            "PSUBSCRIBE" => handle_psubscribe_cmd(pubsub, conn, args),
+            "PUNSUBSCRIBE" => handle_punsubscribe_cmd(pubsub, conn, args),
             "PING" => vec![handle_subscribed_ping(conn, args)],
             "QUIT" => {
                 if let Some(hub) = pubsub {
-                    hub.unsubscribe_all(conn.client_id);
+                    hub.unsubscribe_everything(conn.client_id);
                 }
                 vec![server::cmd_quit(conn)]
             }
-            "RESET" => vec![handle_reset_cmd(pubsub, conn)],
+            "RESET" => vec![handle_reset_cmd(pubsub, clients, conn)],
             _ => vec![RespValue::err(format!(
                 "ERR Can't execute '{}': only (P|S)SUBSCRIBE / (P|S)UNSUBSCRIBE / PING / QUIT / RESET are allowed in this context",
                 cmd.to_lowercase()
@@ -319,25 +419,27 @@ fn try_execute_in_memory_multi(
     match cmd.as_str() {
         "SUBSCRIBE" => Some(handle_subscribe_cmd(pubsub, conn, args)),
         "UNSUBSCRIBE" => Some(handle_unsubscribe_cmd(pubsub, conn, args)),
+        "PSUBSCRIBE" => Some(handle_psubscribe_cmd(pubsub, conn, args)),
+        "PUNSUBSCRIBE" => Some(handle_punsubscribe_cmd(pubsub, conn, args)),
         "PUBLISH" => Some(vec![handle_publish_cmd(pubsub, args)]),
         "PUBSUB" => Some(vec![handle_pubsub_cmd(pubsub, args)]),
-        "RESET" => Some(vec![handle_reset_cmd(pubsub, conn)]),
+        "RESET" => Some(vec![handle_reset_cmd(pubsub, clients, conn)]),
         "PING" => Some(vec![server::cmd_ping(args)]),
         "ECHO" => Some(vec![server::cmd_echo(args)]),
         "QUIT" => {
             if let Some(hub) = pubsub {
-                hub.unsubscribe_all(conn.client_id);
+                hub.unsubscribe_everything(conn.client_id);
             }
             Some(vec![server::cmd_quit(conn)])
         }
-        "SELECT" => Some(vec![server::cmd_select(conn, args)]),
-        "HELLO" => Some(vec![server::cmd_hello(conn, args)]),
-        "CLIENT" => Some(vec![server::cmd_client(conn, args)]),
+        "SELECT" => Some(vec![server::cmd_select(conn, clients, args)]),
+        "HELLO" => Some(vec![server::cmd_hello(conn, clients, args)]),
+        "CLIENT" => Some(vec![server::cmd_client(conn, clients, pubsub, args)]),
         "COMMAND" => Some(vec![server::cmd_command(args)]),
-        "INFO" => Some(vec![server::cmd_info(cache)]),
+        "INFO" => Some(vec![server::cmd_info(cache, clients)]),
         "CONFIG" => Some(vec![server::cmd_config(args)]),
         "TIME" => Some(vec![server::cmd_time()]),
-        "AUTH" => Some(vec![RespValue::ok()]),
+        "AUTH" => Some(vec![server::cmd_auth(conn, args)]),
         "SCRIPT" => Some(vec![handle_script_cmd(lua, args)]),
         "MULTI" => {
             conn.in_multi = true;
@@ -461,6 +563,7 @@ pub fn dispatch_with_spi(
     cache: Option<&L1Cache>,
     lua: Option<&LuaEngine>,
     pubsub: Option<&PubSubHub>,
+    clients: Option<&ClientRegistry>,
     conn: &mut ConnectionState,
     args: &[Bytes],
     mutated_keys: &mut Vec<String>,
@@ -490,6 +593,7 @@ pub fn dispatch_with_spi(
                         cache,
                         lua,
                         pubsub,
+                        clients,
                         conn,
                         q_args,
                         mutated_keys,
@@ -513,7 +617,17 @@ pub fn dispatch_with_spi(
         }
         "EXEC" => Ok(RespValue::err("ERR EXEC without MULTI")),
         "DISCARD" => Ok(RespValue::err("ERR DISCARD without MULTI")),
-        _ => dispatch_single_non_multi(client, plans, cache, lua, pubsub, conn, args, mutated_keys),
+        _ => dispatch_single_non_multi(
+            client,
+            plans,
+            cache,
+            lua,
+            pubsub,
+            clients,
+            conn,
+            args,
+            mutated_keys,
+        ),
     }
 }
 
@@ -528,7 +642,17 @@ pub fn dispatch_from_lua(
     args: &[Bytes],
     mutated_keys: &mut Vec<String>,
 ) -> SpiResult<RespValue> {
-    dispatch_single_non_multi(client, plans, cache, None, pubsub, conn, args, mutated_keys)
+    dispatch_single_non_multi(
+        client,
+        plans,
+        cache,
+        None,
+        pubsub,
+        None,
+        conn,
+        args,
+        mutated_keys,
+    )
 }
 
 fn dispatch_single_non_multi(
@@ -537,6 +661,7 @@ fn dispatch_single_non_multi(
     cache: Option<&L1Cache>,
     lua: Option<&LuaEngine>,
     pubsub: Option<&PubSubHub>,
+    clients: Option<&ClientRegistry>,
     conn: &mut ConnectionState,
     args: &[Bytes],
     mutated_keys: &mut Vec<String>,
@@ -549,19 +674,19 @@ fn dispatch_single_non_multi(
         "ECHO" => Ok(server::cmd_echo(args)),
         "QUIT" => {
             if let Some(hub) = pubsub {
-                hub.unsubscribe_all(conn.client_id);
+                hub.unsubscribe_everything(conn.client_id);
             }
             Ok(server::cmd_quit(conn))
         }
-        "RESET" => Ok(handle_reset_cmd(pubsub, conn)),
-        "SELECT" => Ok(server::cmd_select(conn, args)),
-        "HELLO" => Ok(server::cmd_hello(conn, args)),
-        "CLIENT" => Ok(server::cmd_client(conn, args)),
+        "RESET" => Ok(handle_reset_cmd(pubsub, clients, conn)),
+        "SELECT" => Ok(server::cmd_select(conn, clients, args)),
+        "HELLO" => Ok(server::cmd_hello(conn, clients, args)),
+        "CLIENT" => Ok(server::cmd_client(conn, clients, pubsub, args)),
         "COMMAND" => Ok(server::cmd_command(args)),
-        "INFO" => Ok(server::cmd_info(cache)),
+        "INFO" => Ok(server::cmd_info(cache, clients)),
         "CONFIG" => Ok(server::cmd_config(args)),
         "TIME" => Ok(server::cmd_time()),
-        "AUTH" => Ok(RespValue::ok()),
+        "AUTH" => Ok(server::cmd_auth(conn, args)),
 
         // Pub/Sub (available inside Lua `redis.call` and `MULTI`/`EXEC`)
         "PUBLISH" => Ok(handle_publish_cmd(pubsub, args)),
@@ -594,6 +719,7 @@ fn dispatch_single_non_multi(
 
         // Strings
         "GET" => strings::cmd_get(client, plans, cache, args),
+        "GETEX" => strings::cmd_getex(client, plans, cache, args),
         "SET" => strings::cmd_set(client, plans, cache, args),
         "SETEX" => strings::cmd_setex(client, plans, cache, args, false),
         "PSETEX" => strings::cmd_setex(client, plans, cache, args, true),
@@ -617,6 +743,8 @@ fn dispatch_single_non_multi(
         "PEXPIRE" => keys::cmd_expire(client, cache, args, true, false),
         "EXPIREAT" => keys::cmd_expire(client, cache, args, false, true),
         "PEXPIREAT" => keys::cmd_expire(client, cache, args, true, true),
+        "EXPIRETIME" => keys::cmd_expiretime(client, args, false),
+        "PEXPIRETIME" => keys::cmd_expiretime(client, args, true),
         "TTL" => keys::cmd_ttl(client, args, false),
         "PTTL" => keys::cmd_ttl(client, args, true),
         "PERSIST" => keys::cmd_persist(client, cache, args),
@@ -641,6 +769,7 @@ fn dispatch_single_non_multi(
         "HVALS" => hashes::cmd_hvals(client, args),
         "HINCRBY" => hashes::cmd_hincrby(client, plans, args),
         "HINCRBYFLOAT" => hashes::cmd_hincrbyfloat(client, plans, args),
+        "HSCAN" => hashes::cmd_hscan(client, args),
 
         // Lists
         "LPUSH" => lists::cmd_push(client, args, true, mutated_keys),
@@ -674,6 +803,7 @@ fn dispatch_single_non_multi(
         "ZREVRANK" => zsets::cmd_zrank(client, args, true),
         "ZINCRBY" => zsets::cmd_zincrby(client, plans, args, mutated_keys),
         "ZCOUNT" => zsets::cmd_zcount(client, args),
+        "ZSCAN" => zsets::cmd_zscan(client, args),
 
         // Sets
         "SADD" => sets::cmd_sadd(client, args),
@@ -682,6 +812,7 @@ fn dispatch_single_non_multi(
         "SISMEMBER" => sets::cmd_sismember(client, args),
         "SCARD" => sets::cmd_scard(client, args),
         "SPOP" => sets::cmd_spop(client, args),
+        "SSCAN" => sets::cmd_sscan(client, args),
 
         // Streams
         "XADD" => streams::cmd_xadd(client, args, mutated_keys),
@@ -730,6 +861,7 @@ pub fn execute_batch_in_worker(
     lua: Option<&LuaEngine>,
     notifier: Option<&KeyNotifier>,
     pubsub: Option<&PubSubHub>,
+    clients: Option<&ClientRegistry>,
     conn: &mut ConnectionState,
 ) -> Vec<(RespValue, RespVersion)> {
     let mut responses = Vec::with_capacity(batch.len());
@@ -738,7 +870,9 @@ pub fn execute_batch_in_worker(
     while idx < batch.len() {
         // Drain any commands that can execute purely in memory (zero SPI overhead)
         while idx < batch.len() {
-            if let Some(vals) = try_execute_in_memory_multi(&batch[idx], conn, cache, lua, pubsub) {
+            if let Some(vals) =
+                try_execute_in_memory_multi(&batch[idx], conn, cache, lua, pubsub, clients)
+            {
                 for val in vals {
                     responses.push((val, conn.protocol));
                 }
@@ -756,15 +890,18 @@ pub fn execute_batch_in_worker(
         }
 
         // Collect a contiguous SPI chunk, stopping before multi-frame Pub/Sub mode transitions
-        // (`SUBSCRIBE`, `UNSUBSCRIBE`, `RESET`) when outside `MULTI` so they run via the
-        // multi-response in-memory path on the next iteration.
+        // (`SUBSCRIBE`, `UNSUBSCRIBE`, `PSUBSCRIBE`, `PUNSUBSCRIBE`, `RESET`) when outside `MULTI`
+        // so they run via the multi-response in-memory path on the next iteration.
         let chunk_start = idx;
         let mut sim_in_multi = conn.in_multi;
         while idx < batch.len() {
             let cmd = cmd_name_upper(&batch[idx]);
             if !sim_in_multi
                 && idx > chunk_start
-                && matches!(cmd.as_str(), "SUBSCRIBE" | "UNSUBSCRIBE" | "RESET")
+                && matches!(
+                    cmd.as_str(),
+                    "SUBSCRIBE" | "UNSUBSCRIBE" | "PSUBSCRIBE" | "PUNSUBSCRIBE" | "RESET"
+                )
             {
                 break;
             }
@@ -782,6 +919,7 @@ pub fn execute_batch_in_worker(
         let plans_guard = AssertUnwindSafe(plans);
         let lua_guard = AssertUnwindSafe(lua);
         let pubsub_guard = AssertUnwindSafe(pubsub);
+        let clients_guard = AssertUnwindSafe(clients);
         let chunk_guard = AssertUnwindSafe(chunk);
 
         let (tx_results, mutated_keys): (Vec<(RespValue, RespVersion)>, Vec<String>) =
@@ -796,6 +934,7 @@ pub fn execute_batch_in_worker(
                             *cache_guard,
                             *lua_guard,
                             *pubsub_guard,
+                            *clients_guard,
                             *conn_guard,
                             args,
                             &mut mutated,

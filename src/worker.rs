@@ -11,6 +11,7 @@ use tokio::sync::{mpsc, watch};
 use tokio::task::LocalSet;
 
 use crate::cache::L1Cache;
+use crate::clients::{ClientRegistry, ClientRegistryGuard};
 use crate::commands::{
     execute_batch_in_worker, lists, parse_blocking_command, streams, zsets, BlockingCommand,
     ConnectionState,
@@ -150,6 +151,7 @@ pub extern "C" fn pg_redis_bgworker_main(_arg: pg_sys::Datum) {
     let cache = Rc::new(L1Cache::new(config::cache_capacity()));
     let notifier = Rc::new(KeyNotifier::new());
     let pubsub = Rc::new(PubSubHub::new());
+    let clients = Rc::new(ClientRegistry::new());
 
     // PostgreSQL SPI is strictly single-threaded per backend process.
     // Tokio `current_thread` + `LocalSet` multiplexes all async TCP connections and
@@ -227,22 +229,34 @@ pub extern "C" fn pg_redis_bgworker_main(_arg: pg_sys::Datum) {
                 }
                 accept_res = listener.accept() => {
                     match accept_res {
-                        Ok((stream, _peer)) => {
+                        Ok((mut stream, peer)) => {
+                            if clients.count() >= config::max_clients() {
+                                tokio::task::spawn_local(async move {
+                                    let _ = stream
+                                        .write_all(b"-ERR max number of clients reached\r\n")
+                                        .await;
+                                });
+                                continue;
+                            }
                             let _ = stream.set_nodelay(true);
+                            let peer_addr = peer.to_string();
                             let client_plans = Rc::clone(&plans);
                             let client_cache = Rc::clone(&cache);
                             let client_lua = Rc::clone(&lua_engine);
                             let client_notifier = Rc::clone(&notifier);
                             let client_pubsub = Rc::clone(&pubsub);
+                            let client_registry = Rc::clone(&clients);
                             let client_shutdown = shutdown_rx.clone();
                             tokio::task::spawn_local(async move {
                                 handle_connection(
                                     stream,
+                                    peer_addr,
                                     client_plans,
                                     client_cache,
                                     client_lua,
                                     client_notifier,
                                     client_pubsub,
+                                    client_registry,
                                     client_shutdown,
                                 ).await;
                             });
@@ -286,7 +300,7 @@ async fn bind_with_retry(addr: &str) -> Option<TcpListener> {
 }
 
 async fn flush_pubsub_messages(
-    pubsub_rx: &mut mpsc::UnboundedReceiver<PubSubMessage>,
+    pubsub_rx: &mut mpsc::Receiver<PubSubMessage>,
     stream: &mut TcpStream,
     proto: RespVersion,
     write_buf: &mut BytesMut,
@@ -328,11 +342,13 @@ enum ConnEvent {
 
 async fn handle_connection(
     mut stream: TcpStream,
+    peer_addr: String,
     plans: Rc<Option<PreparedPlans>>,
     cache: Rc<L1Cache>,
     lua: Rc<Option<LuaEngine>>,
     notifier: Rc<KeyNotifier>,
     pubsub: Rc<PubSubHub>,
+    clients: Rc<ClientRegistry>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) {
     let client_id = NEXT_CLIENT_ID.fetch_add(1, Ordering::Relaxed);
@@ -340,7 +356,11 @@ async fn handle_connection(
     let mut read_buf = BytesMut::with_capacity(8192);
     let mut write_buf = BytesMut::with_capacity(8192);
 
-    let (pubsub_tx, mut pubsub_rx) = mpsc::unbounded_channel::<PubSubMessage>();
+    let (kill_tx, mut kill_rx) = watch::channel(false);
+    clients.register(client_id, peer_addr, kill_tx);
+    let _client_guard = ClientRegistryGuard::new(client_id, clients.as_ref());
+
+    let (pubsub_tx, mut pubsub_rx) = mpsc::channel::<PubSubMessage>(config::pubsub_queue_size());
     pubsub.register_client(client_id, pubsub_tx);
     let _pubsub_guard = PubSubClientGuard::new(client_id, pubsub.as_ref());
 
@@ -348,6 +368,13 @@ async fn handle_connection(
         let event = tokio::select! {
             _ = shutdown_rx.changed() => {
                 if *shutdown_rx.borrow() {
+                    ConnEvent::Shutdown
+                } else {
+                    continue;
+                }
+            }
+            _ = kill_rx.changed() => {
+                if *kill_rx.borrow() {
                     ConnEvent::Shutdown
                 } else {
                     continue;
@@ -388,6 +415,17 @@ async fn handle_connection(
             ConnEvent::TcpRead(_) => {}
         }
 
+        if read_buf.len() > config::max_frame_bytes() {
+            write_buf.clear();
+            encode_resp(
+                &RespValue::err("ERR Protocol error: max frame size exceeded"),
+                conn.protocol,
+                &mut write_buf,
+            );
+            let _ = stream.write_all(&write_buf).await;
+            break;
+        }
+
         // Flush any already-queued Pub/Sub messages BEFORE processing client commands
         // (e.g. UNSUBSCRIBE) so messages published prior to UNSUBSCRIBE are strictly delivered first.
         if !flush_pubsub_messages(
@@ -422,11 +460,13 @@ async fn handle_connection(
         let mut write_failed = false;
 
         for cmd_args in decoded {
+            let unauthenticated = config::requirepass().is_some() && !conn.authenticated;
             let in_subscribed_resp2 =
                 conn.protocol == RespVersion::Resp2 && pubsub.subscription_count(client_id) > 0;
-            if let Some(blocking_parsed) =
-                parse_blocking_command(&cmd_args, conn.in_multi || in_subscribed_resp2)
-            {
+            if let Some(blocking_parsed) = parse_blocking_command(
+                &cmd_args,
+                conn.in_multi || unauthenticated || in_subscribed_resp2,
+            ) {
                 // Flush any preceding non-blocking commands first
                 if !pending_batch.is_empty() {
                     let batch = std::mem::take(&mut pending_batch);
@@ -437,6 +477,7 @@ async fn handle_connection(
                         lua.as_ref().as_ref(),
                         Some(notifier.as_ref()),
                         Some(pubsub.as_ref()),
+                        Some(clients.as_ref()),
                         &mut conn,
                     );
                     write_buf.clear();
@@ -452,8 +493,12 @@ async fn handle_connection(
                     }
                 }
 
-                // Re-check subscribed mode in case the preceding batch entered subscribed mode
-                if conn.protocol == RespVersion::Resp2 && pubsub.subscription_count(client_id) > 0 {
+                // Re-check connection mode in case the preceding batch entered MULTI,
+                // de-authenticated (RESET), or entered subscribed mode.
+                let now_unauth = config::requirepass().is_some() && !conn.authenticated;
+                let now_sub_resp2 = conn.protocol == RespVersion::Resp2
+                    && pubsub.subscription_count(client_id) > 0;
+                if conn.in_multi || now_unauth || now_sub_resp2 {
                     pending_batch.push(cmd_args);
                     continue;
                 }
@@ -466,10 +511,16 @@ async fn handle_connection(
                             &stream,
                             &notifier,
                             &mut shutdown_rx,
+                            &mut kill_rx,
                         )
                         .await
                     }
                 };
+
+                if *kill_rx.borrow() {
+                    write_failed = true;
+                    break;
+                }
 
                 write_buf.clear();
                 encode_resp(&resp, conn.protocol, &mut write_buf);
@@ -494,6 +545,7 @@ async fn handle_connection(
                 lua.as_ref().as_ref(),
                 Some(notifier.as_ref()),
                 Some(pubsub.as_ref()),
+                Some(clients.as_ref()),
                 &mut conn,
             );
 
@@ -514,7 +566,7 @@ async fn handle_connection(
             break;
         }
 
-        if conn.should_quit {
+        if conn.should_quit || *kill_rx.borrow() {
             break;
         }
     }
@@ -525,6 +577,7 @@ async fn execute_blocking_command(
     stream: &TcpStream,
     notifier: &KeyNotifier,
     shutdown_rx: &mut watch::Receiver<bool>,
+    kill_rx: &mut watch::Receiver<bool>,
 ) -> RespValue {
     match cmd {
         BlockingCommand::BZPop {
@@ -537,7 +590,7 @@ async fn execute_blocking_command(
             } else {
                 Some(tokio::time::Instant::now() + Duration::from_secs_f64(timeout_secs))
             };
-            wait_for_keys(&keys, deadline, stream, notifier, shutdown_rx, || {
+            wait_for_keys(&keys, deadline, stream, notifier, shutdown_rx, kill_rx, || {
                 let keys_guard = AssertUnwindSafe(&keys);
                 BackgroundWorker::transaction(move || {
                     Spi::connect(|mut client| {
@@ -557,7 +610,7 @@ async fn execute_blocking_command(
             } else {
                 Some(tokio::time::Instant::now() + Duration::from_secs_f64(timeout_secs))
             };
-            wait_for_keys(&keys, deadline, stream, notifier, shutdown_rx, || {
+            wait_for_keys(&keys, deadline, stream, notifier, shutdown_rx, kill_rx, || {
                 let keys_guard = AssertUnwindSafe(&keys);
                 BackgroundWorker::transaction(move || {
                     Spi::connect(|mut client| {
@@ -594,7 +647,7 @@ async fn execute_blocking_command(
             let keys: Vec<String> = resolved.iter().map(|(k, _, _)| k.clone()).collect();
             let count = req.count;
 
-            wait_for_keys(&keys, deadline, stream, notifier, shutdown_rx, || {
+            wait_for_keys(&keys, deadline, stream, notifier, shutdown_rx, kill_rx, || {
                 let res_guard = AssertUnwindSafe(&resolved);
                 BackgroundWorker::transaction(move || {
                     Spi::connect(|client| {
@@ -613,6 +666,7 @@ async fn wait_for_keys<F>(
     stream: &TcpStream,
     notifier: &KeyNotifier,
     shutdown_rx: &mut watch::Receiver<bool>,
+    kill_rx: &mut watch::Receiver<bool>,
     mut try_once: F,
 ) -> RespValue
 where
@@ -642,7 +696,7 @@ where
             break val;
         }
 
-        // Wait on notification, timer slice, shutdown, or client disconnect (EOF)
+        // Wait on notification, timer slice, shutdown, kill, or client disconnect (EOF)
         let wait_fut = async {
             if handles.len() == 1 {
                 if let Some(ref n) = first_notify {
@@ -666,6 +720,11 @@ where
         tokio::select! {
             _ = shutdown_rx.changed() => {
                 if *shutdown_rx.borrow() {
+                    break RespValue::Null;
+                }
+            }
+            _ = kill_rx.changed() => {
+                if *kill_rx.borrow() {
                     break RespValue::Null;
                 }
             }

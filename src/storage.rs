@@ -50,6 +50,24 @@ pub const SQL_EVICT_EXPIRED: &str = "\
         LIMIT 1000 \
     )";
 
+/// Batched TTL eviction for non-string keys tracked in `pg_redis_key_expiry`.
+pub const SQL_EVICT_EXPIRED_NON_STRINGS: &str = "\
+    WITH expired AS ( \
+        DELETE FROM pg_redis_key_expiry \
+        WHERE ctid IN ( \
+            SELECT ctid FROM pg_redis_key_expiry \
+            WHERE expires_at <= NOW() \
+            LIMIT 1000 \
+        ) \
+        RETURNING key \
+    ), \
+    d_h AS (DELETE FROM pg_redis_hashes WHERE key IN (SELECT key FROM expired)), \
+    d_l AS (DELETE FROM pg_redis_lists WHERE key IN (SELECT key FROM expired)), \
+    d_z AS (DELETE FROM pg_redis_zsets WHERE key IN (SELECT key FROM expired)), \
+    d_s AS (DELETE FROM pg_redis_sets WHERE key IN (SELECT key FROM expired)), \
+    d_x AS (DELETE FROM pg_redis_streams WHERE key IN (SELECT key FROM expired)) \
+    SELECT COUNT(*)::BIGINT FROM expired";
+
 /// Cached SPI prepared statements persisted across transactions via `SPI_keepplan` (RFC §5.3).
 pub struct PreparedPlans {
     pub string_get: OwnedPreparedStatement,
@@ -61,6 +79,7 @@ pub struct PreparedPlans {
     pub hash_upsert: OwnedPreparedStatement,
     pub zset_score: OwnedPreparedStatement,
     pub evict_expired: OwnedPreparedStatement,
+    pub evict_expired_non_strings: OwnedPreparedStatement,
 }
 
 impl PreparedPlans {
@@ -91,6 +110,9 @@ impl PreparedPlans {
                 .prepare(SQL_ZSET_SCORE, Some(vec![text, text]))?
                 .keep(),
             evict_expired: client.prepare(SQL_EVICT_EXPIRED, None)?.keep(),
+            evict_expired_non_strings: client
+                .prepare(SQL_EVICT_EXPIRED_NON_STRINGS, None)?
+                .keep(),
         })
     }
 }
@@ -103,7 +125,8 @@ pub fn tables_exist(client: &SpiClient) -> SpiResult<bool> {
              AND to_regclass('pg_redis_lists') IS NOT NULL \
              AND to_regclass('pg_redis_zsets') IS NOT NULL \
              AND to_regclass('pg_redis_sets') IS NOT NULL \
-             AND to_regclass('pg_redis_streams') IS NOT NULL",
+             AND to_regclass('pg_redis_streams') IS NOT NULL \
+             AND to_regclass('pg_redis_key_expiry') IS NOT NULL",
             None,
             None,
         )?
@@ -170,6 +193,13 @@ pub fn ensure_schema(client: &mut SpiClient, unlogged: bool) -> SpiResult<()> {
         ) WITH (fillfactor = 80);
         CREATE INDEX IF NOT EXISTS idx_redis_streams_key_id
             ON pg_redis_streams(key, ms, seq);
+
+        CREATE {table_kw} IF NOT EXISTS pg_redis_key_expiry (
+            key TEXT PRIMARY KEY,
+            expires_at TIMESTAMPTZ NOT NULL
+        ) WITH (fillfactor = 80);
+        CREATE INDEX IF NOT EXISTS idx_redis_key_expiry_at
+            ON pg_redis_key_expiry(expires_at);
         "#
     );
 
@@ -179,8 +209,11 @@ pub fn ensure_schema(client: &mut SpiClient, unlogged: bool) -> SpiResult<()> {
 
 pub fn set_tables_unlogged(client: &mut SpiClient, unlogged: bool) -> SpiResult<()> {
     let mode = if unlogged { "UNLOGGED" } else { "LOGGED" };
+    // Lock in canonical order (strings -> key_expiry -> non-string tables) to prevent
+    // AB-BA deadlocks with concurrent DML/TTL queries.
     for tbl in [
         "pg_redis_strings",
+        "pg_redis_key_expiry",
         "pg_redis_hashes",
         "pg_redis_lists",
         "pg_redis_zsets",
@@ -197,9 +230,20 @@ pub fn evict_expired_batch(
     client: &mut SpiClient,
     plans: Option<&PreparedPlans>,
 ) -> SpiResult<usize> {
-    let table = match plans {
+    let string_evicted = match plans {
         Some(p) => client.update(&p.evict_expired, None, None)?,
         None => client.update(SQL_EVICT_EXPIRED, None, None)?,
-    };
-    Ok(table.len())
+    }
+    .len();
+
+    let non_string_evicted = match plans {
+        Some(p) => client.update(&p.evict_expired_non_strings, None, None)?,
+        None => client.update(SQL_EVICT_EXPIRED_NON_STRINGS, None, None)?,
+    }
+    .first()
+    .get_one::<i64>()?
+    .unwrap_or(0)
+    .max(0) as usize;
+
+    Ok(string_evicted + non_string_evicted)
 }
