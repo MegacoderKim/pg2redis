@@ -1,13 +1,17 @@
 name: Release
 
 on:
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
+    branches: [main]
   push:
     tags:
       - "v*"
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release git tag to build and publish (e.g. v0.4.0)"
+        description: "Release git tag to build and publish (e.g. v0.4.1)"
         required: true
         type: string
       prerelease:
@@ -27,14 +31,24 @@ permissions:
   id-token: write
 
 concurrency:
-  group: release-${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+  group: release-${{ github.event_name == 'workflow_run' && 'main' || (github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name) }}
   cancel-in-progress: false
 
 jobs:
   validate:
     name: Validate Release Metadata & Docs
+    if: >-
+      github.event_name != 'workflow_run'
+      || (
+        github.event.workflow_run.event == 'push'
+        && github.event.workflow_run.head_branch == 'main'
+        && github.event.workflow_run.conclusion == 'success'
+      )
     runs-on: ubuntu-latest
     outputs:
+      should_release: ${{ steps.meta.outputs.should_release }}
+      create_tag: ${{ steps.meta.outputs.create_tag }}
+      checkout_ref: ${{ steps.ref.outputs.checkout_ref }}
       tag: ${{ steps.meta.outputs.tag }}
       version: ${{ steps.meta.outputs.version }}
       major_minor: ${{ steps.meta.outputs.major_minor }}
@@ -42,10 +56,48 @@ jobs:
       publish_docker: ${{ steps.meta.outputs.publish_docker }}
       image_repo: ${{ steps.meta.outputs.image_repo }}
     steps:
-      - name: Resolve release metadata
+      - name: Resolve checkout ref
+        id: ref
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_run" ]; then
+            CHECKOUT_REF="${{ github.event.workflow_run.head_sha }}"
+          elif [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            CHECKOUT_REF="${{ inputs.tag }}"
+          else
+            CHECKOUT_REF="${GITHUB_REF_NAME}"
+          fi
+          echo "checkout_ref=${CHECKOUT_REF}" >> "${GITHUB_OUTPUT}"
+
+      - name: Checkout target ref
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.ref.outputs.checkout_ref }}
+
+      - name: Resolve and validate release metadata
         id: meta
         run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+          CARGO_VER=$(grep -m1 '^version = ' Cargo.toml | sed -E 's/version = "([^"]+)"/\1/')
+          CREATE_TAG="false"
+
+          if [ "${{ github.event_name }}" = "workflow_run" ]; then
+            TAG="v${CARGO_VER}"
+            if git ls-remote --exit-code --tags origin "refs/tags/${TAG}" >/dev/null 2>&1; then
+              echo "Tag '${TAG}' already exists on origin; skipping automatic release on main."
+              echo "Bump version in Cargo.toml to cut a new release."
+              echo "should_release=false" >> "${GITHUB_OUTPUT}"
+              echo "create_tag=false" >> "${GITHUB_OUTPUT}"
+              echo "tag=${TAG}" >> "${GITHUB_OUTPUT}"
+              echo "version=${CARGO_VER}" >> "${GITHUB_OUTPUT}"
+              exit 0
+            fi
+            CREATE_TAG="true"
+            if echo "${TAG}" | grep -qE '-'; then
+              PRERELEASE="true"
+            else
+              PRERELEASE="false"
+            fi
+            PUBLISH_DOCKER="true"
+          elif [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             TAG="${{ inputs.tag }}"
             PRERELEASE="${{ inputs.prerelease }}"
             PUBLISH_DOCKER="${{ inputs.publish_docker }}"
@@ -65,9 +117,17 @@ jobs:
           fi
 
           VERSION="${TAG#v}"
+          echo "Cargo.toml version: ${CARGO_VER} | Target tag: ${TAG}"
+          if [ "${CARGO_VER}" != "${VERSION}" ]; then
+            echo "ERROR: Cargo.toml version (${CARGO_VER}) does not match tag (${VERSION})" >&2
+            exit 1
+          fi
+
           MAJOR_MINOR="$(echo "${VERSION}" | cut -d. -f1,2)"
           IMAGE_REPO="ghcr.io/$(echo "${GITHUB_REPOSITORY}" | tr '[:upper:]' '[:lower:]')"
 
+          echo "should_release=true" >> "${GITHUB_OUTPUT}"
+          echo "create_tag=${CREATE_TAG}" >> "${GITHUB_OUTPUT}"
           echo "tag=${TAG}" >> "${GITHUB_OUTPUT}"
           echo "version=${VERSION}" >> "${GITHUB_OUTPUT}"
           echo "major_minor=${MAJOR_MINOR}" >> "${GITHUB_OUTPUT}"
@@ -75,26 +135,13 @@ jobs:
           echo "publish_docker=${PUBLISH_DOCKER}" >> "${GITHUB_OUTPUT}"
           echo "image_repo=${IMAGE_REPO}" >> "${GITHUB_OUTPUT}"
 
-      - name: Checkout target tag
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ steps.meta.outputs.tag }}
-
-      - name: Verify Cargo.toml version matches tag
-        run: |
-          CARGO_VER=$(grep -m1 '^version = ' Cargo.toml | sed -E 's/version = "([^"]+)"/\1/')
-          EXPECTED="${{ steps.meta.outputs.version }}"
-          echo "Cargo.toml version: ${CARGO_VER} | Expected: ${EXPECTED}"
-          if [ "${CARGO_VER}" != "${EXPECTED}" ]; then
-            echo "ERROR: Cargo.toml version (${CARGO_VER}) does not match tag (${EXPECTED})" >&2
-            exit 1
-          fi
-
       - name: Validate MkDocs build
+        if: steps.meta.outputs.should_release == 'true'
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: |
+      - if: steps.meta.outputs.should_release == 'true'
+        run: |
           pip install --no-cache-dir \
             mkdocs==1.6.1 \
             mkdocs-material==9.6.7 \
@@ -104,6 +151,7 @@ jobs:
   build:
     name: Build & Smoke Test (PG${{ matrix.pg_major }} / ${{ matrix.arch }})
     needs: validate
+    if: needs.validate.outputs.should_release == 'true'
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -126,10 +174,10 @@ jobs:
             platform: linux/arm64
             runner: ubuntu-24.04-arm
     steps:
-      - name: Checkout target tag
+      - name: Checkout target ref
         uses: actions/checkout@v4
         with:
-          ref: ${{ needs.validate.outputs.tag }}
+          ref: ${{ needs.validate.outputs.checkout_ref }}
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -258,7 +306,7 @@ jobs:
   merge-docker-manifest:
     name: Publish Multi-Arch Docker Manifest (PG${{ matrix.pg_major }})
     needs: [validate, build]
-    if: needs.validate.outputs.publish_docker == 'true'
+    if: needs.validate.outputs.should_release == 'true' && needs.validate.outputs.publish_docker == 'true'
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -312,14 +360,29 @@ jobs:
     if: >-
       always()
       && needs.validate.result == 'success'
+      && needs.validate.outputs.should_release == 'true'
       && needs.build.result == 'success'
       && (needs.merge-docker-manifest.result == 'success' || needs.merge-docker-manifest.result == 'skipped')
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout target tag
+      - name: Checkout target ref
         uses: actions/checkout@v4
         with:
-          ref: ${{ needs.validate.outputs.tag }}
+          ref: ${{ needs.validate.outputs.checkout_ref }}
+
+      - name: Create and push release tag (auto-release on main)
+        if: needs.validate.outputs.create_tag == 'true'
+        run: |
+          TAG="${{ needs.validate.outputs.tag }}"
+          if git ls-remote --exit-code --tags origin "refs/tags/${TAG}" >/dev/null 2>&1; then
+            echo "Tag ${TAG} already exists on origin; continuing to release publication."
+          else
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git tag -a "${TAG}" HEAD -m "pg_redis_core ${TAG}"
+            git push origin "${TAG}"
+            echo "Created and pushed annotated tag ${TAG} at $(git rev-parse --short HEAD)"
+          fi
 
       - name: Download extension tarballs
         uses: actions/download-artifact@v4

@@ -61,13 +61,11 @@ All changes follow a branch-and-PR workflow into `main`:
 2. Commit changes, push the branch, and open a Pull Request against `main`.
 3. GitHub Actions CI (`.github/workflows/ci.yml`) validates `mkdocs build --strict` and the full Dockerized integration + `cargo pgrx test pg15` suite before merge.
 4. To cut a release (`vX.Y.Z`):
-   - Bump `version` in `Cargo.toml`, add a `sql/pg_redis_core--<prev>--<next>.sql` upgrade script if schema changed, and update `CHANGELOG.md` via PR.
-   - Tag `main` and push the tag (or trigger **Release** manually from the GitHub Actions UI with `workflow_dispatch`):
-     ```bash
-     git tag -a v0.3.0 -m "pg_redis_core v0.3.0"
-     git push origin v0.3.0
-     ```
-   - `.github/workflows/release.yml` validates version parity, natively builds & smoke-tests `linux/amd64` and `linux/arm64` extension tarballs for both **PostgreSQL 15** and **PostgreSQL 16**, publishes multi-arch Docker images (`:vX.Y.Z-pg15`, `:vX.Y.Z-pg16`, and `:vX.Y.Z`) to `ghcr.io/megacoderkim/pg2redis`, and creates the GitHub Release with `SHA256SUMS.txt`.
+   - Bump `version` in `Cargo.toml`, add a `sql/pg_redis_core--<prev>--<next>.sql` upgrade script, and update `CHANGELOG.md` in your PR.
+   - Merge the PR into `main`. Once **CI** (`.github/workflows/ci.yml`) passes on `main`, **Release** (`.github/workflows/release.yml`) automatically triggers via `workflow_run`:
+     - If tag `vX.Y.Z` already exists on `origin`, it skips cleanly (so docs/CI-only merges never create duplicate releases).
+     - If tag `vX.Y.Z` is new, it natively builds & smoke-tests `linux/amd64` and `linux/arm64` extension tarballs for both **PostgreSQL 15** and **PostgreSQL 16**, publishes multi-arch Docker images (`:vX.Y.Z-pg15`, `:vX.Y.Z-pg16`, and `:vX.Y.Z`) to `ghcr.io/megacoderkim/pg2redis`, pushes annotated tag `vX.Y.Z` on the tested commit, and publishes the GitHub Release with `SHA256SUMS.txt`.
+   - Manual tag pushes (`git tag -a vX.Y.Z && git push origin vX.Y.Z`) and `workflow_dispatch` remain supported as fallbacks.
 
 ## Project Layout
 
