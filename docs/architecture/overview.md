@@ -7,6 +7,7 @@
 ```mermaid
 flowchart TB
     subgraph Clients["Standard Redis Clients (TCP :6379)"]
+        JS["Node.js (ioredis / BullMQ)"]
         PY["Python (redis-py / FastAPI)"]
         KT["Kotlin (Jedis)"]
         GO["Go (go-redis/v9 RESP3)"]
@@ -15,26 +16,29 @@ flowchart TB
 
     subgraph Worker["PostgreSQL Background Worker (pg_redis_bgworker_main)"]
         RT["Tokio current_thread + LocalSet<br/>(Single OS Thread — 100% SPI Safe)"]
+        AUTH["AUTH Gate, Limits &amp; ClientRegistry<br/>(requirepass · max_clients · max_frame_bytes)"]
         PARSE["Zero-Copy RESP Parser<br/>(redis-protocol 6.0 + Inline Fallback)"]
-        BATCH["Pipeline & MULTI/EXEC Batcher"]
+        BATCH["Pipeline &amp; MULTI/EXEC Batcher"]
+        LUA["Sandboxed Lua 5.1 VM<br/>(mlua + Timeout Hook)"]
+        PS["In-Process PubSubHub &amp; KeyNotifier<br/>(Named/Pattern Pub/Sub + Async Blocking)"]
         CACHE["In-Process L1 Hot-Key Cache<br/>(moka::sync::Cache)"]
-        EVICT["Periodic Housekeeping Task<br/>(SIGTERM/SIGHUP + ctid TTL Eviction)"]
+        EVICT["Periodic Housekeeping Task<br/>(SIGTERM/SIGHUP + Universal TTL Eviction)"]
     end
 
-    subgraph Postgres["PostgreSQL 15+ Storage Engine"]
+    subgraph Postgres["PostgreSQL 15 &amp; 16 Storage Engine"]
         SPI["Server Programming Interface (SPI)<br/>Pre-Prepared Plans (SPI_keepplan)"]
         T1[("pg_redis_strings<br/>BYTEA + TIMESTAMPTZ")]
-        T2[("pg_redis_hashes<br/>(key, field) -> value")]
-        T3[("pg_redis_lists<br/>(key, seq) -> value")]
-        T4[("pg_redis_zsets<br/>(key, member) -> score")]
+        T2[("pg_redis_hashes · lists · zsets<br/>sets · streams")]
+        T3[("pg_redis_key_expiry<br/>Universal Non-String TTL")]
     end
 
-    PY & KT & GO & CLI --> RT
-    RT --> PARSE --> BATCH
+    JS & PY & KT & GO & CLI --> RT --> AUTH --> PARSE --> BATCH
     BATCH -->|Hot GET hit| CACHE
+    BATCH -->|Pub/Sub &amp; Blocking| PS
+    BATCH -->|EVAL / EVALSHA| LUA --> SPI
     BATCH -->|Single Tx per Batch| SPI
     EVICT -->|Every eviction_interval_ms| SPI
-    SPI --> T1 & T2 & T3 & T4
+    SPI --> T1 & T2 & T3
 ```
 
 ## Thread-Safety Model: `current_thread` Tokio + `LocalSet`
@@ -93,6 +97,24 @@ While PostgreSQL has a standalone procedural language extension (**`pllua` / `pl
 - **Zero-hop transactional execution** inside the active PostgreSQL SPI transaction.
 
 `pg_redis_core` therefore embeds **Lua 5.1 directly inside the Rust background worker** via `mlua` (`features = ["lua51", "vendored"]`), caching compiled chunks by 40-char SHA1 (`SCRIPT LOAD` / `EVALSHA`) and executing `redis.call(...)` directly against the active PostgreSQL SPI transaction with full ACID atomicity.
+
+To keep user scripts safe inside the PostgreSQL server process:
+
+- **Restricted Stdlib Sandbox:** Only `StdLib::TABLE | StdLib::STRING | StdLib::MATH` are loaded; dangerous globals (`os`, `io`, `package`, `debug`, `dofile`, `loadfile`, `collectgarbage`, `module`, `require`) are absent/stripped.
+- **Execution Timeout Hook:** A Lua instruction hook checks elapsed time against `pg_redis.lua_time_limit_ms` (default `5000` ms) and aborts infinite loops before they can stall the worker.
+
+## In-Process Pub/Sub (`PubSubHub`)
+
+Named-channel (`SUBSCRIBE`/`UNSUBSCRIBE`) and glob-pattern (`PSUBSCRIBE`/`PUNSUBSCRIBE`) Pub/Sub run entirely inside the background worker's `LocalSet` (`src/pubsub.rs`):
+
+- **Zero SPI Overhead & Arbitrary Payload Sizes:** Messages flow directly in memory over bounded per-subscriber Tokio channels (`pg_redis.pubsub_queue_size`, default `4096`), bypassing PostgreSQL's 8 KB `NOTIFY` payload limit and preserving full binary safety.
+- **Slow-Consumer Eviction & RAII Cleanup:** Subscribers that fall behind their queue capacity are evicted without blocking publishers or healthy consumers. Dropping a TCP connection triggers `PubSubClientGuard` cleanup automatically.
+- **Exact Wire Semantics:** Emits `["subscribe"|"unsubscribe"|"psubscribe"|"punsubscribe"|"message"|"pmessage", ...]` frames (as RESP3 Push `>` frames on RESP3 connections), enforces RESP2 subscribed-mode command rules, and supports `PUBLISH` from both Lua scripts (`redis.call('PUBLISH', ...)`) and `MULTI`/`EXEC` transactions.
+
+## Authentication, Resource Limits & Multi-Client Registry (`ClientRegistry`)
+
+- **Authentication & Limits (`src/config.rs`, `src/worker.rs`):** When `pg_redis.requirepass` is set, connections must pass constant-time `AUTH` or `HELLO ... AUTH` before executing commands. Incoming connections are capped by `pg_redis.max_clients`, and buffered RESP requests are bounded by `pg_redis.max_frame_bytes`.
+- **Live Client Tracking (`src/clients.rs`):** Every TCP connection registers with `ClientRegistry`, tracking ID, peer address, client name (`CLIENT SETNAME`), protocol version, and active Pub/Sub subscriptions. This powers `CLIENT LIST [TYPE ...] [ID ...]`, `CLIENT INFO`, `CLIENT KILL [ID|ADDR]`, and `INFO` `# Clients` (`connected_clients`, `maxclients`) — required by BullMQ `queue.getWorkers()` and `queue.getQueueEvents()`.
 
 ## Cooperative Blocking Wakeups (`BZPOPMIN`, `BLPOP`, `XREAD BLOCK`)
 

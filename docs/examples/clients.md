@@ -12,18 +12,31 @@ All runnable Dockerized suites live under [`tests/clients/`](https://github.com/
     import Redis from "ioredis";
 
     const sub = new Redis({ host: "localhost", port: 6379 });
+    const psub = new Redis({ host: "localhost", port: 6379 });
     const pub = new Redis({ host: "localhost", port: 6379 });
 
+    // Wait for ioredis readyCheck (INFO) before entering RESP2 subscribed mode
+    const waitReady = (c) =>
+      c.status === "ready" ? Promise.resolve() : new Promise((res) => c.once("ready", res));
+    await Promise.all([waitReady(sub), waitReady(psub), waitReady(pub)]);
+
+    // Named channel subscription
     await sub.subscribe("medusa:workflow:create-order:tx_01");
     sub.on("message", (channel, payload) => {
       console.log("Workflow event:", channel, JSON.parse(payload));
+    });
+
+    // Glob pattern subscription (PSUBSCRIBE / pmessage)
+    await psub.psubscribe("medusa:workflow:*");
+    psub.on("pmessage", (pattern, channel, payload) => {
+      console.log("Pattern match:", pattern, "->", channel, JSON.parse(payload));
     });
 
     const recipients = await pub.publish(
       "medusa:workflow:create-order:tx_01",
       JSON.stringify({ workflowId: "create-order-workflow", event: "step.succeeded" })
     );
-    console.log("Delivered to", recipients, "subscriber(s)");
+    console.log("Delivered to", recipients, "subscriber(s)"); // 2
     ```
 
     **Run with Docker Compose:**
@@ -262,3 +275,89 @@ Both raw pipelining (`transaction=False` / `rdb.Pipeline()` / `jedis.pipelined()
     pipe.sync()
     println(resp.get()) // "one"
     ```
+
+## Authentication (`pg_redis.requirepass`)
+
+When `pg_redis.requirepass` is configured in PostgreSQL, every standard Redis driver authenticates seamlessly via `AUTH` or RESP3 `HELLO 3 AUTH`:
+
+=== "Node.js (ioredis)"
+
+    ```javascript
+    import Redis from "ioredis";
+
+    const redis = new Redis({
+      host: "localhost",
+      port: 6379,
+      password: process.env.REDIS_PASSWORD,
+    });
+    console.log(await redis.ping()); // PONG
+    ```
+
+=== "Python (redis-py)"
+
+    ```python
+    import os
+    import redis.asyncio as redis
+
+    r = redis.Redis(host="localhost", port=6379, password=os.environ["REDIS_PASSWORD"])
+    await r.ping()  # True
+    ```
+
+=== "Go (go-redis/v9 RESP3)"
+
+    ```go
+    rdb := redis.NewClient(&redis.Options{
+        Addr:     "localhost:6379",
+        Password: os.Getenv("REDIS_PASSWORD"), // sent via HELLO 3 AUTH default <pass>
+    })
+    ```
+
+=== "redis-cli"
+
+    ```bash
+    redis-cli -a "$REDIS_PASSWORD" PING
+    ```
+
+## Universal TTL, Rolling Sessions (`GETEX`) & Collection Scans
+
+`pg_redis_core` supports universal expiration (`EXPIRE`/`PEXPIRE` with `NX|XX|GT|LT`, `EXPIRETIME`/`PEXPIRETIME`) across all 6 data types, rolling session TTLs via `GETEX` (`connect-redis`), and cursor-based scans (`SCAN TYPE`, `HSCAN [NOVALUES]`, `SSCAN`, `ZSCAN`) used by BullMQ `FlowProducer`:
+
+```javascript
+import Redis from "ioredis";
+
+const redis = new Redis({ host: "localhost", port: 6379 });
+
+// Rolling session TTL (connect-redis)
+await redis.set("sess:abc", JSON.stringify({ userId: 42 }), "EX", 300);
+const raw = await redis.getex("sess:abc", "EX", 900); // reads & extends TTL to 900s
+
+// Universal TTL with Redis 7 flags on a Hash
+await redis.hset("cart:42", "sku_1", "2", "sku_2", "1");
+await redis.expire("cart:42", 1800, "NX"); // sets expiry only if none exists
+const [cursor, fields] = await redis.hscan("cart:42", "0", "MATCH", "sku_*", "COUNT", 50);
+
+// Type-filtered key scan & live multi-client inspection
+const [, hashKeys] = await redis.scan("0", "MATCH", "cart:*", "TYPE", "hash");
+const clients = await redis.client("LIST", "TYPE", "normal");
+```
+
+## Sandboxed Lua 5.1 Scripting
+
+Execute atomic multi-key logic inside a single PostgreSQL SPI transaction with `cjson`, `cmsgpack`, and `bit` built in — protected by the restricted Lua 5.1 sandbox and `pg_redis.lua_time_limit_ms`:
+
+```javascript
+const sha = await redis.script(
+  "LOAD",
+  `
+  local current = tonumber(redis.call("GET", KEYS[1]) or "0")
+  if current >= tonumber(ARGV[1]) then
+    return 0
+  end
+  redis.call("INCR", KEYS[1])
+  redis.call("EXPIRE", KEYS[1], tonumber(ARGV[2]), "NX")
+  return 1
+  `
+);
+
+const allowed = await redis.evalsha(sha, 1, "ratelimit:user:42", 100, 60);
+```

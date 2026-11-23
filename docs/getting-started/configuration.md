@@ -53,6 +53,31 @@ ALTER SYSTEM SET pg_redis.cache_ttl_ms = 2000;
 SELECT pg_reload_conf();
 ```
 
+## Security, Sandboxing & Resource Limits
+
+- **Authentication (`pg_redis.requirepass`):** Defined with `SUPERUSER_ONLY` so non-superuser SQL roles cannot read or alter the password. When non-empty, every new RESP connection must authenticate via `AUTH <password>`, `AUTH default <password>`, or `HELLO <2|3> AUTH default <password>` (verified using constant-time byte comparison). Unauthenticated commands fail with `NOAUTH Authentication required`, invalid passwords return `WRONGPASS`, and `RESET` clears per-connection authentication state.
+- **Lua 5.1 Sandboxing & Timeouts (`pg_redis.lua_time_limit_ms`):** The embedded `mlua` Lua 5.1 VM loads only safe standard libraries (`table`, `string`, `math`) and removes `os`, `io`, `package`, `debug`, `dofile`, `loadfile`, `collectgarbage`, `module`, and `require`. An instruction hook aborts runaway scripts once execution exceeds `pg_redis.lua_time_limit_ms` (default `5000` ms; `0` disables).
+- **Connection & Frame Bounds (`pg_redis.max_clients`, `pg_redis.max_frame_bytes`):** Rejects incoming TCP connections once `connected_clients >= pg_redis.max_clients` (default `1000`) with `-ERR max number of clients reached`, and disconnects clients whose buffered RESP frame exceeds `pg_redis.max_frame_bytes` (default `64 MiB`).
+- **Pub/Sub Backpressure (`pg_redis.pubsub_queue_size`):** Each subscriber uses a bounded in-process channel (default `4096` messages). If a slow subscriber overflows its queue, it is automatically evicted so healthy subscribers and publishers are never stalled.
+
+## Database Isolation (`pg_redis.database`)
+
+To keep Redis catalog tables completely separate from your application schema, point `pg_redis.database` at a dedicated database on the same PostgreSQL cluster:
+
+```ini title="postgresql.conf"
+pg_redis.database = 'app_redis'
+```
+
+Create the database and enable the extension inside it (`CREATE DATABASE app_redis;` followed by `\c app_redis` and `CREATE EXTENSION pg_redis_core;`). The background worker attaches exclusively to `app_redis`, leaving your application database untouched.
+
+## Upgrading Between Extension Versions
+
+`pg_redis_core` ships incremental SQL upgrade scripts (`sql/pg_redis_core--0.1.0--0.2.0.sql`, `0.2.0--0.3.0.sql`, `0.3.0--0.4.0.sql`, `0.4.0--0.4.1.sql`). After installing a newer extension package or image, run:
+
+```sql
+ALTER EXTENSION pg_redis_core UPDATE;
+```
+
 ## SQL Functions
 
 ### `redis_dispatcher(cmd, key, arg1, arg2)`
@@ -75,7 +100,7 @@ SELECT redis_dispatcher('ZADD', 'scores', '99.5', 'alice');
 
 ### `pg_redis_set_unlogged(unlogged BOOLEAN)`
 
-Switch all four catalog tables (`pg_redis_strings`, `pg_redis_hashes`, `pg_redis_lists`, `pg_redis_zsets`) between `UNLOGGED` (WAL bypass for maximum write throughput) and `LOGGED` (crash-safe ACID durability):
+Switch all seven catalog tables (`pg_redis_strings`, `pg_redis_key_expiry`, `pg_redis_hashes`, `pg_redis_lists`, `pg_redis_zsets`, `pg_redis_sets`, `pg_redis_streams`) in canonical lock order between `UNLOGGED` (WAL bypass for maximum write throughput) and `LOGGED` (crash-safe ACID durability):
 
 ```sql
 -- Enable WAL bypass for pure caching workloads
@@ -87,7 +112,7 @@ SELECT pg_redis_set_unlogged(false);
 
 ### `pg_redis_evict_expired()`
 
-Trigger one `ctid`-batched TTL eviction cycle (`LIMIT 1000`) manually and return the number of expired rows deleted:
+Trigger one `ctid`-batched TTL eviction cycle (`LIMIT 1000`) manually across both `pg_redis_strings` and `pg_redis_key_expiry` (cascading expired non-string keys out of hashes, lists, sorted sets, sets, and streams) and return the total number of expired entries removed:
 
 ```sql
 SELECT pg_redis_evict_expired();
@@ -95,7 +120,7 @@ SELECT pg_redis_evict_expired();
 
 ### `pg_redis_ensure_schema(unlogged BOOLEAN)`
 
-Idempotently create all four `pg_redis_*` tables and their indexes if they do not already exist:
+Idempotently create all seven `pg_redis_*` tables and their indexes if they do not already exist:
 
 ```sql
 SELECT pg_redis_ensure_schema(false);

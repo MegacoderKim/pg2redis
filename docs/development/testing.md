@@ -26,11 +26,15 @@ This script verifies all RFC acceptance criteria in sequence:
 ## Running `cargo pgrx` Directly via Docker
 
 ```bash
-# Build the dev image with Rust, cargo-pgrx 0.11.4, and PG15 headers
+# Build the dev image with Rust, cargo-pgrx 0.11.4, and PG15 headers (pass --build-arg PG_MAJOR=16 for PG16)
 docker build --target dev -f docker/Dockerfile -t pg_redis_core:dev .
 
-# Run in-PostgreSQL Rust unit tests
+# Run in-PostgreSQL Rust unit tests (PG15)
 docker run --rm pg_redis_core:dev cargo pgrx test pg15
+
+# Or build & test against PostgreSQL 16
+docker build --target dev --build-arg PG_MAJOR=16 -f docker/Dockerfile -t pg_redis_core:dev-pg16 .
+docker run --rm pg_redis_core:dev-pg16 cargo pgrx test pg16 --no-default-features --features pg16
 
 # Launch an interactive psql session via cargo pgrx run pg15
 docker run --rm -it pg_redis_core:dev cargo pgrx run pg15
@@ -61,41 +65,52 @@ All changes follow a branch-and-PR workflow into `main`:
 2. Commit changes, push the branch, and open a Pull Request against `main`.
 3. GitHub Actions CI (`.github/workflows/ci.yml`) validates `mkdocs build --strict` and the full Dockerized integration + `cargo pgrx test pg15` suite before merge.
 4. To cut a release (`vX.Y.Z`):
-   - Bump `version` in `Cargo.toml`, add a `sql/pg_redis_core--<prev>--<next>.sql` upgrade script if schema changed, and update `CHANGELOG.md` via PR.
-   - Tag `main` and push the tag (or trigger **Release** manually from the GitHub Actions UI with `workflow_dispatch`):
-     ```bash
-     git tag -a v0.3.0 -m "pg_redis_core v0.3.0"
-     git push origin v0.3.0
-     ```
-   - `.github/workflows/release.yml` validates version parity, natively builds & smoke-tests `linux/amd64` and `linux/arm64` extension tarballs for both **PostgreSQL 15** and **PostgreSQL 16**, publishes multi-arch Docker images (`:vX.Y.Z-pg15`, `:vX.Y.Z-pg16`, and `:vX.Y.Z`) to `ghcr.io/megacoderkim/pg2redis`, and creates the GitHub Release with `SHA256SUMS.txt`.
+   - Bump `version` in `Cargo.toml`, add a `sql/pg_redis_core--<prev>--<next>.sql` upgrade script, and update `CHANGELOG.md` in your PR.
+   - Merge the PR into `main`. Once **CI** (`.github/workflows/ci.yml`) passes on `main`, **Release** (`.github/workflows/release.yml`) automatically triggers via `workflow_run`:
+     - If tag `vX.Y.Z` already exists on `origin`, it skips cleanly (so docs/CI-only merges never create duplicate releases).
+     - If tag `vX.Y.Z` is new, it natively builds & smoke-tests `linux/amd64` and `linux/arm64` extension tarballs for both **PostgreSQL 15** and **PostgreSQL 16**, publishes multi-arch Docker images (`:vX.Y.Z-pg15`, `:vX.Y.Z-pg16`, and `:vX.Y.Z`) to `ghcr.io/megacoderkim/pg2redis`, pushes annotated tag `vX.Y.Z` on the tested commit, and publishes the GitHub Release with `SHA256SUMS.txt`.
+   - Manual tag pushes (`git tag -a vX.Y.Z && git push origin vX.Y.Z`) and `workflow_dispatch` remain supported as fallbacks.
 
 ## Project Layout
 
 ```text
 pg2redis/
-├── Cargo.toml                 # Rust crate manifest (pgrx 0.11.4, tokio, redis-protocol 6.0, moka)
-├── pg_redis_core.control      # PostgreSQL extension control file
-├── mkdocs.yml                 # Material for MkDocs configuration
-├── docker-compose.yml         # pg-redis, fastapi-gateway, test runners, and docs preview
+├── Cargo.toml                           # Rust crate manifest (pgrx 0.11.4, tokio, redis-protocol 6.0, mlua 0.10, moka)
+├── pg_redis_core.control                # PostgreSQL extension control file
+├── mkdocs.yml                           # Material for MkDocs configuration
+├── docker-compose.yml                   # pg-redis, fastapi-gateway, test runners, and docs preview
+├── .github/workflows/
+│   ├── ci.yml                           # MkDocs strict check + full Dockerized & PG 15/16 CI suite
+│   ├── release.yml                      # Auto-release on main after CI passes (PG15/PG16 amd64/arm64 + GHCR)
+│   └── docs.yml                         # GitHub Pages MkDocs Material deployment
 ├── docker/
-│   ├── Dockerfile             # Multi-stage PG15 builder, dev (pgrx test/run), and runtime targets
-│   ├── Dockerfile.docs        # MkDocs Material build/preview container
-│   ├── init.sql               # CREATE EXTENSION IF NOT EXISTS pg_redis_core;
-│   └── postgresql.conf        # Reference PostgreSQL + pg_redis.* GUC configuration
+│   ├── Dockerfile                       # Multi-stage PG15/PG16 builder, dev (pgrx test/run), and runtime targets
+│   ├── Dockerfile.docs                  # MkDocs Material build/preview container
+│   ├── init.sql                         # CREATE EXTENSION IF NOT EXISTS pg_redis_core;
+│   └── postgresql.conf                  # Reference PostgreSQL + pg_redis.* GUC configuration
+├── sql/                                 # Incremental PostgreSQL extension upgrade scripts (0.1.0 -> 0.4.1)
 ├── src/
-│   ├── lib.rs                 # extension_sql!, _PG_init, redis_dispatcher, SQL helpers, #[pg_test]
-│   ├── config.rs              # PostgreSQL GUC definitions (pg_redis.*)
-│   ├── cache.rs               # In-process moka L1 hot-key cache
-│   ├── protocol.rs            # Zero-copy RESP2/RESP3 codec (redis-protocol 6.0)
-│   ├── storage.rs             # Catalog DDL, SPI PreparedPlans, ctid TTL eviction
-│   ├── worker.rs              # BGWorker + Tokio current_thread/LocalSet TCP listener
-│   └── commands/              # Modular command handlers (strings, keys, hashes, lists, zsets, server)
-├── docs/                      # MkDocs Material documentation source
+│   ├── lib.rs                           # extension_sql!, _PG_init, redis_dispatcher, SQL helpers, #[pg_test]
+│   ├── config.rs                        # PostgreSQL GUC definitions (pg_redis.* + constant-time AUTH compare)
+│   ├── cache.rs                         # In-process moka L1 hot-key cache
+│   ├── clients.rs                       # Live multi-connection ClientRegistry (CLIENT LIST/INFO/KILL, INFO)
+│   ├── lua.rs                           # Sandboxed Lua 5.1 VM (mlua) with timeout hook, cjson, cmsgpack, bit
+│   ├── notify.rs                        # Per-key cooperative async KeyNotifier (BZPOPMIN, BLPOP, XREAD BLOCK)
+│   ├── protocol.rs                      # Zero-copy RESP2/RESP3 codec (redis-protocol 6.0)
+│   ├── pubsub.rs                        # In-process named & pattern PubSubHub with bounded slow-consumer queues
+│   ├── storage.rs                       # 7-table catalog DDL, SPI PreparedPlans, universal ctid TTL eviction
+│   ├── worker.rs                        # BGWorker + Tokio current_thread/LocalSet TCP listener & limits
+│   └── commands/                        # Command handlers (strings, keys, hashes, lists, zsets, sets, streams, server)
+├── docs/                                # MkDocs Material documentation source
 └── tests/
-    ├── raw_resp_test.sh       # Raw TCP RESP2/RESP3 verification
-    ├── run_all_tests.sh       # Master end-to-end verification runner
+    ├── raw_resp_test.sh                 # Raw TCP RESP2/RESP3 verification
+    ├── test_v040_security.sh            # AUTH/requirepass, Lua timeout, max_clients & max_frame_bytes tests
+    ├── test_solar_nest_isolation.sh     # PG 15 & 16 isolated-DB + Pub/Sub + BullMQ suite
+    ├── run_all_tests.sh                 # Master end-to-end verification runner
     └── clients/
-        ├── python/            # FastAPI gateway + redis-py + psycopg pytest suite
-        ├── kotlin/            # Jedis 5.2.0 Gradle project
-        └── go/                # go-redis/v9 RESP3 Go module
+        ├── bullmq/                      # Unmodified bullmq@5.13.0 integration suite
+        ├── pubsub/                      # ioredis@5.11.1 Pub/Sub, v0.4.0 features & security tests
+        ├── python/                      # FastAPI gateway + redis-py + psycopg pytest suite
+        ├── kotlin/                      # Jedis 5.2.0 Gradle project
+        └── go/                          # go-redis/v9 RESP3 Go module
 ```

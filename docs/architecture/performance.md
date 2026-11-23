@@ -18,10 +18,10 @@ On startup, the background worker pre-prepares high-frequency statements (`GET`,
 When a client pipelines bursts of commands over a single socket, the Tokio connection handler drains all complete frames currently buffered in `BytesMut` and executes the entire DB-touching batch inside **one** `BackgroundWorker::transaction` block, amortizing transaction commit overhead across the batch.
 
 ### 4. Heap-Only Tuple (HOT) Updates
-All four catalog tables are configured with `fillfactor = 80`. In-place updates to counters, sessions, and hash fields fit on the same 8KB heap page without modifying B-tree indexes, dramatically reducing vacuum pressure and write amplification.
+All seven catalog tables (`pg_redis_strings`, `pg_redis_hashes`, `pg_redis_lists`, `pg_redis_zsets`, `pg_redis_sets`, `pg_redis_streams`, and `pg_redis_key_expiry`) are configured with `fillfactor = 80`. In-place updates to counters, sessions, hash fields, and TTL metadata fit on the same 8KB heap page without modifying B-tree indexes, dramatically reducing vacuum pressure and write amplification.
 
 ### 5. Optional WAL Bypass (`UNLOGGED` Tables)
-For pure caching workloads where crash-recovery durability is unnecessary, flip tables to `UNLOGGED` to bypass PostgreSQL Write-Ahead Logging (WAL):
+For pure caching workloads where crash-recovery durability is unnecessary, flip all seven tables to `UNLOGGED` to bypass PostgreSQL Write-Ahead Logging (WAL):
 
 ```sql
 SELECT pg_redis_set_unlogged(true);
@@ -29,17 +29,25 @@ SELECT pg_redis_set_unlogged(true);
 
 Or configure `pg_redis.unlogged = on` in `postgresql.conf`.
 
-### 6. Automated `ctid`-Batched TTL Eviction
-Every `pg_redis.eviction_interval_ms` (default `5000ms`), the background worker executes a bounded, non-blocking cleanup pass backed by the partial index `idx_redis_strings_expiry`:
+### 6. Automated `ctid`-Batched Universal TTL Eviction
+Every `pg_redis.eviction_interval_ms` (default `5000ms`), the background worker executes a bounded, non-blocking cleanup pass (`LIMIT 1000`) across both string keys (`idx_redis_strings_expiry`) and non-string keys (`idx_redis_key_expiry_at`):
 
 ```sql
+-- 1. Evict expired string keys
 DELETE FROM pg_redis_strings
 WHERE ctid IN (
     SELECT ctid FROM pg_redis_strings
     WHERE expires_at IS NOT NULL AND expires_at < NOW()
     LIMIT 1000
 );
+
+-- 2. Evict expired non-string keys (hashes, lists, zsets, sets, streams)
+--    using pg_redis_key_expiry (LIMIT 1000) and cascade deletes to data tables.
 ```
+
+### 7. Zero-SPI Pub/Sub & Cooperative Blocking
+- **Pub/Sub (`src/pubsub.rs`):** Named-channel and pattern-based Pub/Sub messages are fanned out strictly in worker memory over bounded Tokio channels (`pg_redis.pubsub_queue_size`), avoiding PostgreSQL SPI transactions and bypassing the 8 KB `LISTEN`/`NOTIFY` payload limit.
+- **Async Blocking (`src/notify.rs`):** `BZPOPMIN`, `BZPOPMAX`, `BLPOP`, `BRPOP`, and `XREAD BLOCK` suspend cooperatively on per-key `tokio::sync::Notify` handles instead of polling PostgreSQL.
 
 ## Measured Docker Benchmark Results
 
@@ -51,9 +59,13 @@ Measured inside the `pg_redis_core:latest` Docker container (`postgres:15-bookwo
 | Pipelined `SET` (`-P 16`, 10 clients) | `UNLOGGED` (WAL bypass) | **8,542 req/s** | `9.22 ms` |
 | Hot-key `GET` (`-P 16`, 10 clients) | In-process L1 `moka` cache | **504,000 req/s** | `0.27 ms` |
 
-Inspect live L1 cache hit/miss counters anytime via `redis-cli INFO`:
+Inspect live client counts and L1 cache hit/miss counters anytime via `redis-cli INFO`:
 
 ```text
+# Clients
+connected_clients:3
+maxclients:1000
+
 # Stats
 l1_cache_enabled:1
 l1_cache_hits:1028
