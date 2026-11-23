@@ -1,6 +1,6 @@
 # Supported Redis Commands
 
-`pg_redis_core` supports **100+ Redis commands** over both **RESP2** and **RESP3** (plus inline commands), covering Strings (`GETEX`), Universal Keys/Expiry across all 6 data types (`EXPIRE`/`PEXPIRE` with `NX|XX|GT|LT`), Hashes (`HSCAN`), Lists, Sorted Sets (`ZSCAN`), Sets (`SSCAN`), Streams, **Pub/Sub** (`PUBLISH`/`SUBSCRIBE`/`UNSUBSCRIBE`/`PSUBSCRIBE`/`PUNSUBSCRIBE`/`PUBSUB`), Blocking Operations (`BZPOPMIN`, `XREAD BLOCK`), Sandboxed Lua 5.1 Scripting (`EVAL`/`EVALSHA`/`SCRIPT`), Transactions, `AUTH` (`requirepass`), and Multi-Client `CLIENT LIST`/`KILL` — verified on **PostgreSQL 15 & 16** for **BullMQ 5.13.0** and **Medusa 2.22.7 (`ioredis 5.11.1`)**.
+`pg_redis_core` supports **115 Redis commands** over both **RESP2** and **RESP3** (plus inline commands), covering Strings (`GETEX`), Universal Keys/Expiry across all 6 data types (`EXPIRE`/`PEXPIRE` with `NX|XX|GT|LT`, `EXPIRETIME`/`PEXPIRETIME`), Hashes (`HSCAN`), Lists, Sorted Sets (`ZSCAN`), Sets (`SSCAN`), Streams, **Pub/Sub** (`PUBLISH`/`SUBSCRIBE`/`UNSUBSCRIBE`/`PSUBSCRIBE`/`PUNSUBSCRIBE`/`PUBSUB`), Blocking Operations (`BZPOPMIN`, `BLPOP`, `XREAD BLOCK`), Sandboxed Lua 5.1 Scripting (`EVAL`/`EVALSHA`/`SCRIPT`), Transactions, `AUTH` (`requirepass`), and Multi-Client `CLIENT LIST`/`KILL` — verified on **PostgreSQL 15 & 16** for **BullMQ 5.13.0** and **Medusa 2.22.7 (`ioredis 5.11.1`)**.
 
 ## Strings
 
@@ -138,8 +138,8 @@
 | `PUNSUBSCRIBE` | `PUNSUBSCRIBE [pattern ...]` | Unsubscribes specific patterns or all patterns (0 args) |
 | `PUBSUB` | `PUBSUB CHANNELS [pattern] \| NUMSUB [ch ...] \| NUMPAT` | Inspect active named channels, live subscriber counts, and active pattern subscriptions |
 
-!!! note "Pub/Sub Scope"
-    Named-channel (`SUBSCRIBE`/`UNSUBSCRIBE`) and pattern (`PSUBSCRIBE`/`PUNSUBSCRIBE`) Pub/Sub run in-process inside the background worker's Tokio `LocalSet` over bounded queues (`pg_redis.pubsub_queue_size`) with zero SPI overhead and automatic cleanup on disconnect or slow-consumer overflow. Sharded Pub/Sub (`SSUBSCRIBE`/`SUNSUBSCRIBE`) is not implemented.
+!!! note "Pub/Sub Scope & RESP2 Subscribed Mode"
+    Named-channel (`SUBSCRIBE`/`UNSUBSCRIBE`) and pattern (`PSUBSCRIBE`/`PUNSUBSCRIBE`) Pub/Sub run in-process inside the background worker's Tokio `LocalSet` over bounded queues (`pg_redis.pubsub_queue_size`) with zero SPI overhead and automatic cleanup on disconnect or slow-consumer overflow. In **RESP2** subscribed mode, only `SUBSCRIBE`, `UNSUBSCRIBE`, `PSUBSCRIBE`, `PUNSUBSCRIBE`, `PING` (replying `["pong", msg]`), `QUIT`, and `RESET` are permitted; **RESP3** permits concurrent non-Pub/Sub commands on the same connection. Sharded Pub/Sub (`SSUBSCRIBE`/`SUNSUBSCRIBE`) is not implemented.
 
 ## Transactions & Server / Protocol
 
@@ -150,8 +150,8 @@
 | `HELLO` | `HELLO [2\|3 [AUTH u p] [SETNAME name]]` | Dynamic RESP2 / RESP3 protocol negotiation & inline authentication |
 | `PING` / `ECHO` | `PING [msg]` / `ECHO msg` | Resolved in memory without SPI overhead (returns `["pong", msg]` in RESP2 subscribed mode) |
 | `RESET` | `RESET` | Unsubscribes all channels/patterns, clears `MULTI` state, resets auth & protocol to RESP2, returns `+RESET` |
-| `CLIENT` | `CLIENT SETINFO \| SETNAME \| GETNAME \| ID \| LIST \| INFO \| KILL` | Full multi-connection registry (`LIST [TYPE ...] [ID ...]`, `KILL ID\|ADDR`) for BullMQ `getWorkers()`, `go-redis/v9`, `redis-py`, `ioredis`, and `Jedis` |
-| `INFO` | `INFO [section]` | Reports `pg_redis_core` version, connected clients/maxclients, PG config, and L1 cache hit/miss stats |
-| `COMMAND` | `COMMAND [COUNT \| DOCS \| LIST]` | `redis-cli` interactive startup compatibility |
-| `CONFIG GET` | `CONFIG GET pattern` | Returns basic server config keys (`maxclients`, `lua-time-limit`, `maxmemory-policy`, etc.) |
+| `CLIENT` | `CLIENT SETINFO \| SETNAME \| GETNAME \| ID \| LIST \| INFO \| KILL \| MAINT_NOTIFICATIONS \| NO-EVICT \| NO-TOUCH` | Full multi-connection registry (`LIST [TYPE ...] [ID ...]`, `KILL [ID\|ADDR\|ip:port]`) for BullMQ `getWorkers()`, `go-redis/v9`, `redis-py`, `ioredis`, and `Jedis` |
+| `INFO` | `INFO [section]` | Reports `pg_redis_core` version, `# Clients` (`connected_clients`, `maxclients`), `# Memory` (`maxmemory_policy:noeviction`), `# Stats` (L1 cache hit/miss counters), and `# Replication` |
+| `COMMAND` | `COMMAND [COUNT \| DOCS \| LIST]` | `redis-cli` interactive startup compatibility (returns all 115 supported commands) |
+| `CONFIG GET` | `CONFIG GET pattern` | Glob-matched server config keys (`databases`, `save`, `appendonly`, `maxmemory-policy`, `maxclients`, `lua-time-limit`, `port`) |
 | `SELECT` / `TIME` / `QUIT` | Standard Redis syntax | Session lifecycle commands |

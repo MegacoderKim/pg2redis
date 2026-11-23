@@ -102,3 +102,31 @@ ON pg_redis_key_expiry(expires_at);
 ### Sorted Sets (`pg_redis_zsets`)
 - **Deterministic Tie-Breaking:** Queries order by `score ASC, member ASC` (or `score DESC, member DESC` for `REV` / `ZREVRANGE`), matching Redis's exact lexicographical tie-breaking on equal scores.
 - **Flag Support:** `ZADD` supports `NX`, `XX`, `GT`, `LT`, `CH`, and `INCR`, as well as `+inf` / `-inf` scores and exclusive score bounds like `(100`.
+
+### Sets (`pg_redis_sets`)
+- **Uniqueness by Primary Key:** `(key, member)` guarantees O(log N) uniqueness for `SADD`, `SREM`, `SISMEMBER`, `SCARD`, `SMEMBERS`, `SPOP`, and cursor-based `SSCAN`.
+
+### Streams (`pg_redis_streams`)
+- **Monotonic Entry Ordering:** Composite primary key `(key, ms, seq)` orders stream entries chronologically for `XADD` (`*`, `<ms>-*`, explicit `<ms>-<seq>`, `NOMKSTREAM`, `MAXLEN`/`MINID`), `XTRIM`, `XRANGE`/`XREVRANGE`, `XLEN`, `XDEL`, and `XREAD [COUNT] [BLOCK]`.
+- **Field Serialization:** Stream entry field/value pairs are stored in `fields` and decoded back into ordered RESP arrays.
+
+### Universal Key Expiry (`pg_redis_key_expiry`)
+- **All 6 Data Types:** While string keys store `expires_at` inline in `pg_redis_strings`, non-string keys (Hashes, Lists, Sorted Sets, Sets, and Streams) store their expiration timestamp in `pg_redis_key_expiry(key, expires_at)`.
+- **Redis 7 Flags & Queries:** `EXPIRE`, `PEXPIRE`, `EXPIREAT`, and `PEXPIREAT` support `NX`, `XX`, `GT`, and `LT` across every data type; `TTL`, `PTTL`, `EXPIRETIME`, `PEXPIRETIME`, `PERSIST`, `RENAME`, `EXISTS`, `TYPE`, `KEYS`, `SCAN`, and `DBSIZE` honor universal expiration consistently.
+- **Lazy + Active Cleanup:** Reads filter out keys whose `pg_redis_key_expiry.expires_at <= NOW()` and background eviction deletes expired rows in `LIMIT 1000` batches via `idx_redis_key_expiry_at`, cascading deletions across all five non-string tables.
+
+### Canonical Lock Ordering
+To prevent AB-BA deadlocks between concurrent DDL operations (`pg_redis_set_unlogged`) and multi-table commands (`EXPIRE`, `DEL`, `RENAME`), all multi-table operations acquire locks in a single canonical order:
+
+```text
+pg_redis_strings -> pg_redis_key_expiry -> pg_redis_hashes -> pg_redis_lists -> pg_redis_zsets -> pg_redis_sets -> pg_redis_streams
+```
+
+## Extension Upgrade Scripts
+
+Schema evolutions are packaged as standard PostgreSQL extension migration files under `sql/`:
+
+- `sql/pg_redis_core--0.1.0--0.2.0.sql` — adds `pg_redis_sets` and `pg_redis_streams`.
+- `sql/pg_redis_core--0.2.0--0.3.0.sql` — version bump for Pub/Sub & PostgreSQL 16 support.
+- `sql/pg_redis_core--0.3.0--0.4.0.sql` — adds `pg_redis_key_expiry` and `idx_redis_key_expiry_at`.
+- `sql/pg_redis_core--0.4.0--0.4.1.sql` — patch release upgrade marker.

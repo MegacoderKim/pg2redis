@@ -115,6 +115,6 @@ nav:
   - Reference:
       - Supported Redis Commands: reference/commands.md
   - Client Examples:
-      - Python, Kotlin, Go & BullMQ: examples/clients.md
+      - Python, Kotlin, Go, ioredis & BullMQ: examples/clients.md
   - Development:
       - Building & Testing: development/testing.md

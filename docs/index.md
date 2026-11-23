@@ -10,14 +10,15 @@ hide:
   <span class="hero-badge">PostgreSQL 15 &amp; 16</span>
   <span class="hero-badge">Rust + pgrx 0.11</span>
   <span class="hero-badge">RESP2 &amp; RESP3</span>
-  <span class="hero-badge">Pub/Sub (ioredis 5.11)</span>
-  <span class="hero-badge">Lua 5.1 (EVAL/EVALSHA)</span>
+  <span class="hero-badge">Pub/Sub (Named &amp; Pattern)</span>
+  <span class="hero-badge">Sandboxed Lua 5.1</span>
+  <span class="hero-badge">AUTH &amp; Universal TTL</span>
   <span class="hero-badge">BullMQ 5.13 Ready</span>
 </div>
 
 # pg_redis_core
 
-Speak native **Redis (RESP2 &amp; RESP3)** on port `6379` directly inside **PostgreSQL**. Keep your existing `redis-py`, `Jedis`, and `go-redis/v9` drivers while unifying cache and relational persistence inside a single ACID-compliant database.
+Speak native **Redis (RESP2 &amp; RESP3)** on port `6379` directly inside **PostgreSQL 15 &amp; 16**. Keep your existing `ioredis`, `BullMQ`, `redis-py`, `Jedis`, and `go-redis/v9` drivers while unifying cache, queues, Pub/Sub, and relational persistence inside a single ACID-compliant database.
 
 <div class="hero-actions" markdown>
 [Get Started in 60s](getting-started/quickstart.md){ .md-button .md-button--primary }
@@ -60,7 +61,7 @@ Speak native **Redis (RESP2 &amp; RESP3)** on port `6379` directly inside **Post
 
     ---
 
-    Query, join, audit, and back up your Redis keys directly using standard PostgreSQL SQL (`pg_redis_strings`, `pg_redis_hashes`, `pg_redis_lists`, `pg_redis_zsets`).
+    Query, join, audit, and back up your Redis keys directly using standard PostgreSQL SQL across all seven catalog tables (`pg_redis_strings`, `pg_redis_hashes`, `pg_redis_lists`, `pg_redis_zsets`, `pg_redis_sets`, `pg_redis_streams`, `pg_redis_key_expiry`) with universal TTL support.
 
 -   :material-flash:{ .lg .middle } **Engineered for Speed**
 
@@ -72,7 +73,19 @@ Speak native **Redis (RESP2 &amp; RESP3)** on port `6379` directly inside **Post
 
     ---
 
-    Verified against unmodified **BullMQ 5.13.0** (Medusa queues: Lua 5.1 + `cmsgpack` + `cjson` + `XADD` + `BZPOPMIN`), `redis-py` / `FastAPI`, `Jedis` (Kotlin), `go-redis/v9` (RESP3), and `redis-cli`.
+    Verified against unmodified **BullMQ 5.13.0** (Medusa queues: sandboxed Lua 5.1 + `cmsgpack` + `cjson` + `XADD` + `BZPOPMIN` + `HSCAN`/`SSCAN`/`ZSCAN` + `CLIENT LIST`), **`ioredis@5.11.1`**, `redis-py` / `FastAPI`, `Jedis` (Kotlin), `go-redis/v9` (RESP3), and `redis-cli`.
+
+-   :material-broadcast:{ .lg .middle } **In-Process Named & Pattern Pub/Sub**
+
+    ---
+
+    Zero-SPI-overhead `PUBLISH`, `SUBSCRIBE`, `UNSUBSCRIBE`, `PSUBSCRIBE`, `PUNSUBSCRIBE`, and `PUBSUB` (`CHANNELS`/`NUMSUB`/`NUMPAT`) supporting binary-safe payloads far beyond PostgreSQL's 8 KB `NOTIFY` limit with bounded slow-consumer queues.
+
+-   :material-shield-lock:{ .lg .middle } **Production Security & Resource Limits**
+
+    ---
+
+    Constant-time `AUTH` & `HELLO ... AUTH` (`pg_redis.requirepass`), sandboxed Lua 5.1 VM with configurable execution timeout (`pg_redis.lua_time_limit_ms`), connection caps (`pg_redis.max_clients`), and frame memory bounds (`pg_redis.max_frame_bytes`).
 
 </div>
 
@@ -83,6 +96,7 @@ git clone https://github.com/MegacoderKim/pg2redis.git
 cd pg2redis
 
 # Boot PostgreSQL 15 with pg_redis_core listening on :5432 and :6379
+# (or pull prebuilt ghcr.io/megacoderkim/pg2redis:latest-pg16)
 docker compose up -d --build --wait pg-redis
 
 # Write via Redis protocol
@@ -96,16 +110,21 @@ docker compose exec pg-redis psql -U postgres -c \
 ```mermaid
 flowchart LR
     C1["Python<br/>redis-py / FastAPI"] -->|RESP2 :6379| BG
-    C2["Kotlin<br/>Jedis 5.2"] -->|RESP2 :6379| BG
-    C3["Go<br/>go-redis/v9"] -->|RESP3 :6379| BG
+    C2["Node.js<br/>ioredis / BullMQ"] -->|RESP2 :6379| BG
+    C3["Kotlin / Go<br/>Jedis · go-redis/v9"] -->|RESP2/3 :6379| BG
 
-    subgraph PG["PostgreSQL 15+ Process"]
-        BG["pg_redis_core BGWorker<br/>Tokio current_thread + redis-protocol"]
+    subgraph PG["PostgreSQL 15 & 16 Process"]
+        BG["pg_redis_core BGWorker<br/>Tokio current_thread + AUTH/Limits"]
         L1["L1 Hot-Key Cache<br/>(moka)"]
+        PS["PubSubHub &amp; KeyNotifier<br/>(Named/Pattern + Blocking)"]
+        LUA["Sandboxed Lua 5.1<br/>(mlua + Timeout)"]
         SPI["Prepared SPI Plans<br/>(SPI_keepplan)"]
-        TBL[("Relational Catalog<br/>strings · hashes · lists · zsets")]
+        TBL[("Relational Catalog<br/>strings · hashes · lists · zsets<br/>sets · streams · key_expiry")]
 
         BG -->|Hot GET| L1
+        BG -->|Pub/Sub &amp; Block| PS
+        BG -->|EVAL/EVALSHA| LUA
+        LUA --> SPI
         BG -->|Batched Tx| SPI
         SPI --> TBL
     end
