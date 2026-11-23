@@ -2,6 +2,7 @@ use bytes::Bytes;
 use pgrx::prelude::*;
 use pgrx::spi::{SpiClient, SpiResult};
 
+use crate::commands::keys;
 use crate::protocol::{format_score, RespValue};
 use crate::storage::{PreparedPlans, SQL_HASH_GET, SQL_HASH_GETALL, SQL_HASH_UPSERT};
 
@@ -34,6 +35,7 @@ pub fn cmd_hset(
     }
 
     let key = as_str(&args[1]);
+    keys::purge_if_expired_non_string(client, &key)?;
     let mut added: i64 = 0;
 
     for pair in args[2..].chunks_exact(2) {
@@ -75,6 +77,7 @@ pub fn cmd_hsetnx(client: &mut SpiClient, args: &[Bytes]) -> SpiResult<RespValue
         return Ok(RespValue::wrong_arity("hsetnx"));
     }
     let key = as_str(&args[1]);
+    keys::purge_if_expired_non_string(client, &key)?;
     let field = as_str(&args[2]);
     let value = as_str(&args[3]);
     let res = client.update(
@@ -101,6 +104,9 @@ pub fn cmd_hget(
     }
     let key = as_str(&args[1]);
     let field = as_str(&args[2]);
+    if keys::is_non_string_expired(client, &key)? {
+        return Ok(RespValue::Null);
+    }
 
     let table = match plans {
         Some(p) => client.select(
@@ -136,6 +142,9 @@ pub fn cmd_hmget(
         return Ok(RespValue::wrong_arity("hmget"));
     }
     let key = as_str(&args[1]);
+    if keys::is_non_string_expired(client, &key)? {
+        return Ok(RespValue::Array(vec![RespValue::Null; args.len() - 2]));
+    }
     let mut out = Vec::with_capacity(args.len() - 2);
 
     for raw_field in &args[2..] {
@@ -177,6 +186,9 @@ pub fn cmd_hgetall(
         return Ok(RespValue::wrong_arity("hgetall"));
     }
     let key = as_str(&args[1]);
+    if keys::is_non_string_expired(client, &key)? {
+        return Ok(RespValue::Map(Vec::new()));
+    }
     let table = match plans {
         Some(p) => client.select(&p.hash_getall, None, Some(vec![key.into_datum()]))?,
         None => client.select(
@@ -200,6 +212,9 @@ pub fn cmd_hdel(client: &mut SpiClient, args: &[Bytes]) -> SpiResult<RespValue> 
         return Ok(RespValue::wrong_arity("hdel"));
     }
     let key = as_str(&args[1]);
+    if keys::purge_if_expired_non_string(client, &key)? {
+        return Ok(RespValue::Integer(0));
+    }
     let mut deleted: i64 = 0;
 
     for raw_field in &args[2..] {
@@ -215,6 +230,10 @@ pub fn cmd_hdel(client: &mut SpiClient, args: &[Bytes]) -> SpiResult<RespValue> 
         deleted += res.len() as i64;
     }
 
+    if deleted > 0 {
+        keys::cleanup_expiry_if_empty(client, "pg_redis_hashes", &key)?;
+    }
+
     Ok(RespValue::Integer(deleted))
 }
 
@@ -224,6 +243,9 @@ pub fn cmd_hexists(client: &SpiClient, args: &[Bytes]) -> SpiResult<RespValue> {
     }
     let key = as_str(&args[1]);
     let field = as_str(&args[2]);
+    if keys::is_non_string_expired(client, &key)? {
+        return Ok(RespValue::Integer(0));
+    }
     let exists = client
         .select(
             "SELECT EXISTS(SELECT 1 FROM pg_redis_hashes WHERE key = $1 AND field = $2)",
@@ -244,6 +266,9 @@ pub fn cmd_hlen(client: &SpiClient, args: &[Bytes]) -> SpiResult<RespValue> {
         return Ok(RespValue::wrong_arity("hlen"));
     }
     let key = as_str(&args[1]);
+    if keys::is_non_string_expired(client, &key)? {
+        return Ok(RespValue::Integer(0));
+    }
     let count = client
         .select(
             "SELECT COUNT(*)::BIGINT FROM pg_redis_hashes WHERE key = $1",
@@ -261,6 +286,9 @@ pub fn cmd_hkeys(client: &SpiClient, args: &[Bytes]) -> SpiResult<RespValue> {
         return Ok(RespValue::wrong_arity("hkeys"));
     }
     let key = as_str(&args[1]);
+    if keys::is_non_string_expired(client, &key)? {
+        return Ok(RespValue::Array(Vec::new()));
+    }
     let table = client.select(
         "SELECT field FROM pg_redis_hashes WHERE key = $1 ORDER BY field ASC",
         None,
@@ -280,6 +308,9 @@ pub fn cmd_hvals(client: &SpiClient, args: &[Bytes]) -> SpiResult<RespValue> {
         return Ok(RespValue::wrong_arity("hvals"));
     }
     let key = as_str(&args[1]);
+    if keys::is_non_string_expired(client, &key)? {
+        return Ok(RespValue::Array(Vec::new()));
+    }
     let table = client.select(
         "SELECT value FROM pg_redis_hashes WHERE key = $1 ORDER BY field ASC",
         None,
@@ -307,6 +338,7 @@ pub fn cmd_hincrby(
     let Some(delta) = parse_i64(&args[3]) else {
         return Ok(RespValue::not_integer_err());
     };
+    keys::purge_if_expired_non_string(client, &key)?;
 
     let current = {
         let table = match plans {
@@ -377,6 +409,7 @@ pub fn cmd_hincrbyfloat(
     let Some(delta) = parse_f64(&args[3]) else {
         return Ok(RespValue::not_float_err());
     };
+    keys::purge_if_expired_non_string(client, &key)?;
 
     let current = {
         let table = match plans {
@@ -439,4 +472,98 @@ pub fn cmd_hincrbyfloat(
     }
 
     Ok(RespValue::bulk(formatted))
+}
+
+/// `HSCAN key cursor [MATCH pattern] [COUNT count] [NOVALUES]`
+pub fn cmd_hscan(client: &SpiClient, args: &[Bytes]) -> SpiResult<RespValue> {
+    if args.len() < 3 {
+        return Ok(RespValue::wrong_arity("hscan"));
+    }
+    let key = as_str(&args[1]);
+    let Some(cursor) = parse_i64(&args[2]) else {
+        return Ok(RespValue::err("ERR invalid cursor"));
+    };
+    if cursor < 0 {
+        return Ok(RespValue::err("ERR invalid cursor"));
+    }
+
+    let mut pattern: Option<String> = None;
+    let mut count: usize = 10;
+    let mut novalues = false;
+
+    let mut i = 3;
+    while i < args.len() {
+        let opt = as_str(&args[i]).to_uppercase();
+        match opt.as_str() {
+            "MATCH" => {
+                if i + 1 >= args.len() {
+                    return Ok(RespValue::syntax_err());
+                }
+                pattern = Some(as_str(&args[i + 1]));
+                i += 2;
+            }
+            "COUNT" => {
+                if i + 1 >= args.len() {
+                    return Ok(RespValue::syntax_err());
+                }
+                let Some(c) = parse_i64(&args[i + 1]) else {
+                    return Ok(RespValue::not_integer_err());
+                };
+                if c <= 0 {
+                    return Ok(RespValue::syntax_err());
+                }
+                count = c as usize;
+                i += 2;
+            }
+            "NOVALUES" => {
+                novalues = true;
+                i += 1;
+            }
+            _ => return Ok(RespValue::syntax_err()),
+        }
+    }
+
+    if keys::is_non_string_expired(client, &key)? {
+        return Ok(RespValue::Array(vec![
+            RespValue::bulk("0"),
+            RespValue::Array(Vec::new()),
+        ]));
+    }
+
+    let table = client.select(
+        "SELECT field, value FROM pg_redis_hashes WHERE key = $1 ORDER BY field ASC",
+        None,
+        Some(vec![(PgBuiltInOids::TEXTOID.oid(), key.into_datum())]),
+    )?;
+
+    let mut entries: Vec<(String, String)> = Vec::with_capacity(table.len());
+    for row in table {
+        let f: String = row.get(1)?.unwrap_or_default();
+        let v: String = row.get(2)?.unwrap_or_default();
+        entries.push((f, v));
+    }
+
+    let start = cursor as usize;
+    let end = (start + count).min(entries.len());
+    let next_cursor = if end >= entries.len() { 0 } else { end };
+
+    let mut batch = Vec::new();
+    if start < entries.len() {
+        for (f, v) in &entries[start..end] {
+            if let Some(ref pat) = pattern {
+                if !keys::glob_match(pat, f) {
+                    continue;
+                }
+            }
+            batch.push(RespValue::bulk(f.clone()));
+            if !novalues {
+                batch.push(RespValue::bulk(v.clone()));
+            }
+        }
+    }
+
+    Ok(RespValue::Array(vec![
+        RespValue::bulk(next_cursor.to_string()),
+        RespValue::Array(batch),
+    ]))
 }

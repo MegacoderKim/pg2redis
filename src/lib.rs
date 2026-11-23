@@ -1,4 +1,5 @@
 mod cache;
+mod clients;
 mod commands;
 mod config;
 mod lua;
@@ -81,6 +82,15 @@ CREATE TABLE IF NOT EXISTS pg_redis_streams (
 
 CREATE INDEX IF NOT EXISTS idx_redis_streams_key_id
 ON pg_redis_streams(key, ms, seq);
+
+-- 7. Key Expiry for non-string structures (Hashes, Lists, ZSets, Sets, Streams)
+CREATE TABLE IF NOT EXISTS pg_redis_key_expiry (
+    key TEXT PRIMARY KEY,
+    expires_at TIMESTAMPTZ NOT NULL
+) WITH (fillfactor = 80);
+
+CREATE INDEX IF NOT EXISTS idx_redis_key_expiry_at
+ON pg_redis_key_expiry(expires_at);
 "#,
     name = "pg_redis_schema",
     bootstrap
@@ -135,6 +145,7 @@ pub fn redis_dispatcher(
             None,
             None,
             lua_engine.as_ref(),
+            None,
             None,
             &mut conn,
             &args,
@@ -403,13 +414,16 @@ mod tests {
         use tokio::sync::mpsc;
 
         let hub = crate::pubsub::PubSubHub::new();
-        let (tx1, mut rx1) = mpsc::unbounded_channel();
-        let (tx2, mut rx2) = mpsc::unbounded_channel();
+        let (tx1, mut rx1) = mpsc::channel(16);
+        let (tx2, mut rx2) = mpsc::channel(16);
+        let (tx_slow, _rx_slow) = mpsc::channel(2);
         hub.register_client(1, tx1);
         hub.register_client(2, tx2);
+        hub.register_client(3, tx_slow);
 
         let ch_a = Bytes::from_static(b"wf:order:1");
         let ch_b = Bytes::from_static(b"wf:order:2");
+        let pat_wf = Bytes::from_static(b"wf:*");
 
         // Subscribe + duplicate idempotency
         assert_eq!(hub.subscribe(1, ch_a.clone()), 1);
@@ -417,20 +431,63 @@ mod tests {
         assert_eq!(hub.subscribe(1, ch_b.clone()), 2);
         assert_eq!(hub.subscribe(2, ch_a.clone()), 1);
 
-        // Publish to 2 subscribers (binary + >8KB payload)
+        // Pattern subscribe + duplicate idempotency + NUMPAT
+        assert_eq!(hub.psubscribe(2, pat_wf.clone()), 2);
+        assert_eq!(hub.psubscribe(2, pat_wf.clone()), 2);
+        assert_eq!(hub.numpat(), 1);
+
+        // Publish to 2 channel subscribers + 1 pattern match (total 3 deliveries)
         let mut big_payload = vec![0u8, 1u8, 0xffu8, b'\r', b'\n'];
         big_payload.resize(32 * 1024, b'x');
         let payload = Bytes::from(big_payload);
-        assert_eq!(hub.publish(&ch_a, &payload), 2);
-        assert_eq!(rx1.try_recv().unwrap().payload, payload);
-        assert_eq!(rx2.try_recv().unwrap().payload, payload);
+        assert_eq!(hub.publish(&ch_a, &payload), 3);
+        match rx1.try_recv().unwrap() {
+            crate::pubsub::PubSubMessage::Channel { payload: p, .. } => assert_eq!(p, payload),
+            other => panic!("expected Channel message, got {other:?}"),
+        }
+        let mut got_ch = false;
+        let mut got_pat = false;
+        for _ in 0..2 {
+            match rx2.try_recv().unwrap() {
+                crate::pubsub::PubSubMessage::Channel { payload: p, .. } => {
+                    assert_eq!(p, payload);
+                    got_ch = true;
+                }
+                crate::pubsub::PubSubMessage::Pattern {
+                    pattern,
+                    channel,
+                    payload: p,
+                } => {
+                    assert_eq!(pattern, pat_wf);
+                    assert_eq!(channel, ch_a);
+                    assert_eq!(p, payload);
+                    got_pat = true;
+                }
+            }
+        }
+        assert!(got_ch && got_pat);
         assert!(rx1.try_recv().is_err());
 
-        // Unsubscribe one channel
+        // Unsubscribe one channel & pattern
         assert_eq!(hub.unsubscribe(1, &ch_a), 1);
+        assert_eq!(hub.punsubscribe(2, &pat_wf), 1);
+        assert_eq!(hub.numpat(), 0);
         assert_eq!(hub.publish(&ch_a, &Bytes::from_static(b"one")), 1);
-        assert_eq!(rx2.try_recv().unwrap().payload, Bytes::from_static(b"one"));
-        assert!(rx1.try_recv().is_err());
+        match rx2.try_recv().unwrap() {
+            crate::pubsub::PubSubMessage::Channel { payload: p, .. } => {
+                assert_eq!(p, Bytes::from_static(b"one"))
+            }
+            other => panic!("expected Channel message, got {other:?}"),
+        }
+
+        // Slow consumer eviction on bounded channel overflow
+        let slow_ch = Bytes::from_static(b"slow:chan");
+        assert_eq!(hub.subscribe(3, slow_ch.clone()), 1);
+        assert_eq!(hub.publish(&slow_ch, &Bytes::from_static(b"m1")), 1);
+        assert_eq!(hub.publish(&slow_ch, &Bytes::from_static(b"m2")), 1);
+        // 3rd publish overflows capacity=2 and evicts client 3
+        assert_eq!(hub.publish(&slow_ch, &Bytes::from_static(b"m3")), 0);
+        assert_eq!(hub.subscription_count(3), 0);
 
         // Unsubscribe all
         let acks = hub.unsubscribe_all(1);
@@ -442,6 +499,178 @@ mod tests {
             let _guard = crate::pubsub::PubSubClientGuard::new(2, &hub);
         }
         assert_eq!(hub.publish(&ch_a, &Bytes::from_static(b"none")), 0);
+    }
+
+    #[pg_test]
+    fn test_lua_sandbox_globals() {
+        let res = crate::redis_dispatcher(
+            "EVAL".to_string(),
+            Some(
+                "return cjson.encode({ \
+                    os = type(os), \
+                    io = type(io), \
+                    pkg = type(package), \
+                    dbg = type(debug), \
+                    dofile = type(dofile), \
+                    loadfile = type(loadfile), \
+                    require = type(require), \
+                    math = type(math), \
+                    str = type(string), \
+                    tbl = type(table) \
+                 })"
+                .to_string(),
+            ),
+            Some("0".to_string()),
+            None,
+        );
+        assert!(res.contains("\"os\":\"nil\""), "unexpected: {res}");
+        assert!(res.contains("\"io\":\"nil\""), "unexpected: {res}");
+        assert!(res.contains("\"pkg\":\"nil\""), "unexpected: {res}");
+        assert!(res.contains("\"dbg\":\"nil\""), "unexpected: {res}");
+        assert!(res.contains("\"dofile\":\"nil\""), "unexpected: {res}");
+        assert!(res.contains("\"loadfile\":\"nil\""), "unexpected: {res}");
+        assert!(res.contains("\"require\":\"nil\""), "unexpected: {res}");
+        assert!(res.contains("\"math\":\"table\""), "unexpected: {res}");
+        assert!(res.contains("\"str\":\"table\""), "unexpected: {res}");
+        assert!(res.contains("\"tbl\":\"table\""), "unexpected: {res}");
+    }
+
+    #[pg_test]
+    fn test_universal_ttl_and_scans() {
+        // Follow canonical lock order (strings -> key_expiry -> hashes -> zsets -> sets)
+        // so parallel `#[pg_test]` runs never deadlock with `test_unlogged_toggle`.
+        assert_eq!(
+            crate::redis_dispatcher(
+                "SET".to_string(),
+                Some("sess:1".to_string()),
+                Some("tok".to_string()),
+                None
+            ),
+            "+OK\r\n"
+        );
+        assert_eq!(
+            crate::redis_dispatcher(
+                "GETEX".to_string(),
+                Some("sess:1".to_string()),
+                Some("EX".to_string()),
+                Some("30".to_string())
+            ),
+            "$3\r\ntok\r\n"
+        );
+        let sess_ttl =
+            crate::redis_dispatcher("TTL".to_string(), Some("sess:1".to_string()), None, None);
+        assert!(
+            sess_ttl.starts_with(':') && sess_ttl != ":-1\r\n" && sess_ttl != ":-2\r\n",
+            "sess_ttl={sess_ttl}"
+        );
+
+        // Hash + universal EXPIRE + TTL + PERSIST + HSCAN
+        assert_eq!(
+            crate::redis_dispatcher(
+                "HSET".to_string(),
+                Some("h:ttl".to_string()),
+                Some("f1".to_string()),
+                Some("v1".to_string())
+            ),
+            ":1\r\n"
+        );
+        assert_eq!(
+            crate::redis_dispatcher(
+                "EXPIRE".to_string(),
+                Some("h:ttl".to_string()),
+                Some("60".to_string()),
+                None
+            ),
+            ":1\r\n"
+        );
+        let ttl = crate::redis_dispatcher("TTL".to_string(), Some("h:ttl".to_string()), None, None);
+        assert!(ttl.starts_with(':') && ttl != ":-1\r\n" && ttl != ":-2\r\n", "ttl={ttl}");
+
+        // EXPIRE NX should fail when TTL already exists
+        assert_eq!(
+            crate::redis_dispatcher(
+                "EXPIRE".to_string(),
+                Some("h:ttl".to_string()),
+                Some("120".to_string()),
+                Some("NX".to_string())
+            ),
+            ":0\r\n"
+        );
+        // EXPIRE GT should succeed for larger TTL
+        assert_eq!(
+            crate::redis_dispatcher(
+                "EXPIRE".to_string(),
+                Some("h:ttl".to_string()),
+                Some("120".to_string()),
+                Some("GT".to_string())
+            ),
+            ":1\r\n"
+        );
+        assert_eq!(
+            crate::redis_dispatcher("PERSIST".to_string(), Some("h:ttl".to_string()), None, None),
+            ":1\r\n"
+        );
+        assert_eq!(
+            crate::redis_dispatcher("TTL".to_string(), Some("h:ttl".to_string()), None, None),
+            ":-1\r\n"
+        );
+
+        let hscan = crate::redis_dispatcher(
+            "HSCAN".to_string(),
+            Some("h:ttl".to_string()),
+            Some("0".to_string()),
+            None,
+        );
+        assert!(hscan.contains("$2\r\nf1\r\n$2\r\nv1\r\n"), "hscan={hscan}");
+
+        // ZSet + ZSCAN
+        assert_eq!(
+            crate::redis_dispatcher(
+                "ZADD".to_string(),
+                Some("z:scan".to_string()),
+                Some("42".to_string()),
+                Some("alice".to_string())
+            ),
+            ":1\r\n"
+        );
+        let zscan = crate::redis_dispatcher(
+            "ZSCAN".to_string(),
+            Some("z:scan".to_string()),
+            Some("0".to_string()),
+            None,
+        );
+        assert!(zscan.contains("$5\r\nalice\r\n$2\r\n42\r\n"), "zscan={zscan}");
+
+        // Set + SSCAN + immediate expiry with EXPIRE 0
+        assert_eq!(
+            crate::redis_dispatcher(
+                "SADD".to_string(),
+                Some("s:ttl".to_string()),
+                Some("m1".to_string()),
+                None
+            ),
+            ":1\r\n"
+        );
+        let sscan = crate::redis_dispatcher(
+            "SSCAN".to_string(),
+            Some("s:ttl".to_string()),
+            Some("0".to_string()),
+            None,
+        );
+        assert!(sscan.contains("$2\r\nm1\r\n"), "sscan={sscan}");
+        assert_eq!(
+            crate::redis_dispatcher(
+                "EXPIRE".to_string(),
+                Some("s:ttl".to_string()),
+                Some("0".to_string()),
+                None
+            ),
+            ":1\r\n"
+        );
+        assert_eq!(
+            crate::redis_dispatcher("SCARD".to_string(), Some("s:ttl".to_string()), None, None),
+            ":0\r\n"
+        );
     }
 }
 

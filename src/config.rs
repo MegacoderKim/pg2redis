@@ -19,6 +19,17 @@ pub static CACHE_TTL_MS: GucSetting<i32> = GucSetting::<i32>::new(500);
 
 pub static EVICTION_INTERVAL_MS: GucSetting<i32> = GucSetting::<i32>::new(5_000);
 
+pub static REQUIREPASS: GucSetting<Option<&'static CStr>> =
+    GucSetting::<Option<&'static CStr>>::new(None);
+
+pub static LUA_TIME_LIMIT_MS: GucSetting<i32> = GucSetting::<i32>::new(5_000);
+
+pub static MAX_CLIENTS: GucSetting<i32> = GucSetting::<i32>::new(1_000);
+
+pub static MAX_FRAME_BYTES: GucSetting<i32> = GucSetting::<i32>::new(67_108_864);
+
+pub static PUBSUB_QUEUE_SIZE: GucSetting<i32> = GucSetting::<i32>::new(4_096);
+
 pub fn register_gucs(in_shared_preload: bool) {
     // PostgreSQL forbids defining PGC_POSTMASTER GUCs after server startup (e.g., when
     // `CREATE EXTENSION pg_redis_core` is run without `shared_preload_libraries`).
@@ -109,6 +120,59 @@ pub fn register_gucs(in_shared_preload: bool) {
         GucContext::Sighup,
         GucFlags::default(),
     );
+
+    GucRegistry::define_string_guc(
+        "pg_redis.requirepass",
+        "Password required from RESP clients via AUTH or HELLO ... AUTH.",
+        "Unset or empty disables authentication.",
+        &REQUIREPASS,
+        GucContext::Sighup,
+        GucFlags::SUPERUSER_ONLY,
+    );
+
+    GucRegistry::define_int_guc(
+        "pg_redis.lua_time_limit_ms",
+        "Maximum execution time in milliseconds for a single Lua EVAL/EVALSHA script (0 disables).",
+        "Defaults to 5000ms.",
+        &LUA_TIME_LIMIT_MS,
+        0,
+        600_000,
+        GucContext::Sighup,
+        GucFlags::default(),
+    );
+
+    GucRegistry::define_int_guc(
+        "pg_redis.max_clients",
+        "Maximum concurrent RESP TCP connections accepted by the background worker.",
+        "Defaults to 1000.",
+        &MAX_CLIENTS,
+        1,
+        100_000,
+        GucContext::Sighup,
+        GucFlags::default(),
+    );
+
+    GucRegistry::define_int_guc(
+        "pg_redis.max_frame_bytes",
+        "Maximum buffered RESP request bytes allowed per client connection.",
+        "Defaults to 64 MiB (67108864 bytes).",
+        &MAX_FRAME_BYTES,
+        4_096,
+        536_870_912,
+        GucContext::Sighup,
+        GucFlags::default(),
+    );
+
+    GucRegistry::define_int_guc(
+        "pg_redis.pubsub_queue_size",
+        "Maximum queued Pub/Sub messages per subscriber before evicting a slow consumer.",
+        "Defaults to 4096 messages.",
+        &PUBSUB_QUEUE_SIZE,
+        16,
+        1_000_000,
+        GucContext::Sighup,
+        GucFlags::default(),
+    );
 }
 
 pub fn bind_address() -> String {
@@ -149,4 +213,40 @@ pub fn cache_ttl_ms() -> u64 {
 
 pub fn eviction_interval_ms() -> u64 {
     EVICTION_INTERVAL_MS.get().max(100) as u64
+}
+
+pub fn requirepass() -> Option<String> {
+    REQUIREPASS
+        .get()
+        .and_then(|c| c.to_str().ok())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+}
+
+pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    let len_diff = a.len() ^ b.len();
+    let max_len = a.len().max(b.len());
+    let mut diff: u8 = 0;
+    for i in 0..max_len {
+        let ab = *a.get(i).unwrap_or(&0);
+        let bb = *b.get(i).unwrap_or(&0);
+        diff |= ab ^ bb;
+    }
+    len_diff == 0 && diff == 0
+}
+
+pub fn lua_time_limit_ms() -> u64 {
+    LUA_TIME_LIMIT_MS.get().max(0) as u64
+}
+
+pub fn max_clients() -> usize {
+    MAX_CLIENTS.get().max(1) as usize
+}
+
+pub fn max_frame_bytes() -> usize {
+    MAX_FRAME_BYTES.get().max(4_096) as usize
+}
+
+pub fn pubsub_queue_size() -> usize {
+    PUBSUB_QUEUE_SIZE.get().max(16) as usize
 }

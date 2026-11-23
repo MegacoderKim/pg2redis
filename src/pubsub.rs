@@ -5,38 +5,67 @@ use tokio::sync::mpsc;
 
 use crate::protocol::RespValue;
 
-/// Binary-safe Pub/Sub message delivered to a subscribed connection.
+/// Binary-safe Pub/Sub message delivered to a subscribed connection (channel or pattern match).
 #[derive(Clone, Debug)]
-pub struct PubSubMessage {
-    pub channel: Bytes,
-    pub payload: Bytes,
+pub enum PubSubMessage {
+    Channel {
+        channel: Bytes,
+        payload: Bytes,
+    },
+    Pattern {
+        pattern: Bytes,
+        channel: Bytes,
+        payload: Bytes,
+    },
 }
 
 impl PubSubMessage {
     pub fn into_resp(self) -> RespValue {
-        RespValue::Push(vec![
-            RespValue::bulk("message"),
-            RespValue::BulkString(self.channel),
-            RespValue::BulkString(self.payload),
-        ])
+        match self {
+            PubSubMessage::Channel { channel, payload } => RespValue::Push(vec![
+                RespValue::bulk("message"),
+                RespValue::BulkString(channel),
+                RespValue::BulkString(payload),
+            ]),
+            PubSubMessage::Pattern {
+                pattern,
+                channel,
+                payload,
+            } => RespValue::Push(vec![
+                RespValue::bulk("pmessage"),
+                RespValue::BulkString(pattern),
+                RespValue::BulkString(channel),
+                RespValue::BulkString(payload),
+            ]),
+        }
     }
 }
 
 struct ClientPubSub {
-    sender: mpsc::UnboundedSender<PubSubMessage>,
+    sender: mpsc::Sender<PubSubMessage>,
     channels: Vec<Bytes>,
     channel_set: HashSet<Bytes>,
+    patterns: Vec<Bytes>,
+    pattern_set: HashSet<Bytes>,
+}
+
+impl ClientPubSub {
+    fn total_subscriptions(&self) -> usize {
+        self.channels.len() + self.patterns.len()
+    }
 }
 
 struct PubSubState {
     channels: HashMap<Bytes, HashSet<u64>>,
+    patterns: HashMap<Bytes, HashSet<u64>>,
     clients: HashMap<u64, ClientPubSub>,
 }
 
 /// In-process zero-copy Pub/Sub broker running on the background worker's `LocalSet`.
 ///
-/// Supports arbitrary binary payloads without PostgreSQL's 8KB `NOTIFY` limit,
-/// strict per-publisher FIFO delivery, exact subscriber counts, and RAII cleanup on disconnect.
+/// Supports both named-channel (`SUBSCRIBE`/`UNSUBSCRIBE`) and glob pattern
+/// (`PSUBSCRIBE`/`PUNSUBSCRIBE`) subscriptions over bounded per-client Tokio channels
+/// so stalled consumers are evicted instead of growing worker memory unboundedly.
 pub struct PubSubHub {
     state: RefCell<PubSubState>,
 }
@@ -46,12 +75,13 @@ impl PubSubHub {
         Self {
             state: RefCell::new(PubSubState {
                 channels: HashMap::new(),
+                patterns: HashMap::new(),
                 clients: HashMap::new(),
             }),
         }
     }
 
-    pub fn register_client(&self, client_id: u64, sender: mpsc::UnboundedSender<PubSubMessage>) {
+    pub fn register_client(&self, client_id: u64, sender: mpsc::Sender<PubSubMessage>) {
         let mut st = self.state.borrow_mut();
         st.clients.insert(
             client_id,
@@ -59,12 +89,14 @@ impl PubSubHub {
                 sender,
                 channels: Vec::new(),
                 channel_set: HashSet::new(),
+                patterns: Vec::new(),
+                pattern_set: HashSet::new(),
             },
         );
     }
 
-    /// Subscribe `client_id` to `channel`. Duplicate subscriptions are idempotent and
-    /// return the unchanged subscription count.
+    /// Subscribe `client_id` to named `channel`. Duplicate subscriptions are idempotent and
+    /// return the unchanged total subscription count (`channels + patterns`).
     pub fn subscribe(&self, client_id: u64, channel: Bytes) -> usize {
         let mut st = self.state.borrow_mut();
         let Some(client) = st.clients.get_mut(&client_id) else {
@@ -74,14 +106,14 @@ impl PubSubHub {
         if is_new {
             client.channels.push(channel.clone());
         }
-        let total = client.channels.len();
+        let total = client.total_subscriptions();
         if is_new {
             st.channels.entry(channel).or_default().insert(client_id);
         }
         total
     }
 
-    /// Unsubscribe `client_id` from a single `channel`. Returns remaining subscription count.
+    /// Unsubscribe `client_id` from a single named `channel`. Returns remaining total count.
     pub fn unsubscribe(&self, client_id: u64, channel: &Bytes) -> usize {
         let mut st = self.state.borrow_mut();
         let (removed, remaining) = match st.clients.get_mut(&client_id) {
@@ -90,7 +122,7 @@ impl PubSubHub {
                 if removed {
                     client.channels.retain(|c| c != channel);
                 }
-                (removed, client.channels.len())
+                (removed, client.total_subscriptions())
             }
             None => (false, 0),
         };
@@ -109,20 +141,20 @@ impl PubSubHub {
         remaining
     }
 
-    /// Unsubscribe `client_id` from all channels, returning `(channel, remaining_count)`
-    /// in subscription order down to `0`.
+    /// Unsubscribe `client_id` from all named channels, returning `(channel, remaining_total)`
+    /// in subscription order down to `pattern_count`.
     pub fn unsubscribe_all(&self, client_id: u64) -> Vec<(Bytes, usize)> {
         let mut st = self.state.borrow_mut();
-        let removed_channels = match st.clients.get_mut(&client_id) {
+        let (removed_channels, pattern_count) = match st.clients.get_mut(&client_id) {
             Some(client) => {
                 client.channel_set.clear();
-                std::mem::take(&mut client.channels)
+                (std::mem::take(&mut client.channels), client.patterns.len())
             }
-            None => Vec::new(),
+            None => (Vec::new(), 0),
         };
 
         let mut acks = Vec::with_capacity(removed_channels.len());
-        let mut remaining = removed_channels.len();
+        let mut remaining = removed_channels.len() + pattern_count;
 
         for ch in removed_channels {
             remaining -= 1;
@@ -140,7 +172,99 @@ impl PubSubHub {
         acks
     }
 
+    /// Subscribe `client_id` to glob `pattern`. Duplicate pattern subscriptions are idempotent.
+    pub fn psubscribe(&self, client_id: u64, pattern: Bytes) -> usize {
+        let mut st = self.state.borrow_mut();
+        let Some(client) = st.clients.get_mut(&client_id) else {
+            return 0;
+        };
+        let is_new = client.pattern_set.insert(pattern.clone());
+        if is_new {
+            client.patterns.push(pattern.clone());
+        }
+        let total = client.total_subscriptions();
+        if is_new {
+            st.patterns.entry(pattern).or_default().insert(client_id);
+        }
+        total
+    }
+
+    /// Unsubscribe `client_id` from a single glob `pattern`. Returns remaining total count.
+    pub fn punsubscribe(&self, client_id: u64, pattern: &Bytes) -> usize {
+        let mut st = self.state.borrow_mut();
+        let (removed, remaining) = match st.clients.get_mut(&client_id) {
+            Some(client) => {
+                let removed = client.pattern_set.remove(pattern);
+                if removed {
+                    client.patterns.retain(|p| p != pattern);
+                }
+                (removed, client.total_subscriptions())
+            }
+            None => (false, 0),
+        };
+
+        if removed {
+            let mut empty = false;
+            if let Some(subs) = st.patterns.get_mut(pattern) {
+                subs.remove(&client_id);
+                empty = subs.is_empty();
+            }
+            if empty {
+                st.patterns.remove(pattern);
+            }
+        }
+
+        remaining
+    }
+
+    /// Unsubscribe `client_id` from all patterns, returning `(pattern, remaining_total)`
+    /// in subscription order down to `channel_count`.
+    pub fn punsubscribe_all(&self, client_id: u64) -> Vec<(Bytes, usize)> {
+        let mut st = self.state.borrow_mut();
+        let (removed_patterns, channel_count) = match st.clients.get_mut(&client_id) {
+            Some(client) => {
+                client.pattern_set.clear();
+                (std::mem::take(&mut client.patterns), client.channels.len())
+            }
+            None => (Vec::new(), 0),
+        };
+
+        let mut acks = Vec::with_capacity(removed_patterns.len());
+        let mut remaining = removed_patterns.len() + channel_count;
+
+        for pat in removed_patterns {
+            remaining -= 1;
+            let mut empty = false;
+            if let Some(subs) = st.patterns.get_mut(&pat) {
+                subs.remove(&client_id);
+                empty = subs.is_empty();
+            }
+            if empty {
+                st.patterns.remove(&pat);
+            }
+            acks.push((pat, remaining));
+        }
+
+        acks
+    }
+
+    /// Unsubscribe `client_id` from all named channels and patterns (used by `RESET` and `QUIT`).
+    pub fn unsubscribe_everything(&self, client_id: u64) {
+        let _ = self.unsubscribe_all(client_id);
+        let _ = self.punsubscribe_all(client_id);
+    }
+
+    /// Total active subscriptions (named channels + patterns) for `client_id`.
     pub fn subscription_count(&self, client_id: u64) -> usize {
+        self.state
+            .borrow()
+            .clients
+            .get(&client_id)
+            .map(ClientPubSub::total_subscriptions)
+            .unwrap_or(0)
+    }
+
+    pub fn channel_subscription_count(&self, client_id: u64) -> usize {
         self.state
             .borrow()
             .clients
@@ -149,28 +273,70 @@ impl PubSubHub {
             .unwrap_or(0)
     }
 
-    /// Publish `payload` to all live subscribers on `channel`.
-    /// Returns the exact number of clients that received the message.
+    pub fn pattern_subscription_count(&self, client_id: u64) -> usize {
+        self.state
+            .borrow()
+            .clients
+            .get(&client_id)
+            .map(|c| c.patterns.len())
+            .unwrap_or(0)
+    }
+
+    /// Publish `payload` to all live channel and matching pattern subscribers on `channel`.
+    /// Returns the exact total number of deliveries made.
+    /// Subscribers whose bounded queue is full or closed are evicted cleanly.
     pub fn publish(&self, channel: &Bytes, payload: &Bytes) -> i64 {
-        let mut dead_clients = Vec::new();
+        let mut dead_clients: HashSet<u64> = HashSet::new();
         let mut delivered: i64 = 0;
 
         {
             let st = self.state.borrow();
+
+            // 1. Named channel subscribers
             if let Some(subs) = st.channels.get(channel) {
                 for &cid in subs {
                     if let Some(client) = st.clients.get(&cid) {
-                        let msg = PubSubMessage {
+                        let msg = PubSubMessage::Channel {
                             channel: channel.clone(),
                             payload: payload.clone(),
                         };
-                        if client.sender.send(msg).is_ok() {
+                        if client.sender.try_send(msg).is_ok() {
                             delivered += 1;
                         } else {
-                            dead_clients.push(cid);
+                            dead_clients.insert(cid);
                         }
                     } else {
-                        dead_clients.push(cid);
+                        dead_clients.insert(cid);
+                    }
+                }
+            }
+
+            // 2. Glob pattern subscribers
+            if !st.patterns.is_empty() {
+                let channel_str = String::from_utf8_lossy(channel);
+                for (pat, subs) in &st.patterns {
+                    let pat_str = String::from_utf8_lossy(pat);
+                    if !crate::commands::keys::glob_match(&pat_str, &channel_str) {
+                        continue;
+                    }
+                    for &cid in subs {
+                        if dead_clients.contains(&cid) {
+                            continue;
+                        }
+                        if let Some(client) = st.clients.get(&cid) {
+                            let msg = PubSubMessage::Pattern {
+                                pattern: pat.clone(),
+                                channel: channel.clone(),
+                                payload: payload.clone(),
+                            };
+                            if client.sender.try_send(msg).is_ok() {
+                                delivered += 1;
+                            } else {
+                                dead_clients.insert(cid);
+                            }
+                        } else {
+                            dead_clients.insert(cid);
+                        }
                     }
                 }
             }
@@ -183,7 +349,7 @@ impl PubSubHub {
         delivered
     }
 
-    /// Remove a disconnected client and prune all of its channel subscriptions.
+    /// Remove a disconnected or slow-evicted client and prune all of its subscriptions.
     pub fn remove_client(&self, client_id: u64) {
         let mut st = self.state.borrow_mut();
         if let Some(client) = st.clients.remove(&client_id) {
@@ -197,10 +363,20 @@ impl PubSubHub {
                     st.channels.remove(&ch);
                 }
             }
+            for pat in client.patterns {
+                let mut empty = false;
+                if let Some(subs) = st.patterns.get_mut(&pat) {
+                    subs.remove(&client_id);
+                    empty = subs.is_empty();
+                }
+                if empty {
+                    st.patterns.remove(&pat);
+                }
+            }
         }
     }
 
-    /// List active channels (used by `PUBSUB CHANNELS [pattern]`).
+    /// List active named channels (used by `PUBSUB CHANNELS [pattern]`).
     pub fn active_channels(&self, pattern: Option<&str>) -> Vec<Bytes> {
         let st = self.state.borrow();
         let mut out: Vec<Bytes> = st
@@ -229,6 +405,12 @@ impl PubSubHub {
                 (ch.clone(), count)
             })
             .collect()
+    }
+
+    /// Total number of active pattern subscriptions across all clients (`PUBSUB NUMPAT`).
+    pub fn numpat(&self) -> i64 {
+        let st = self.state.borrow();
+        st.patterns.values().map(|s| s.len() as i64).sum()
     }
 }
 

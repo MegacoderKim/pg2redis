@@ -451,6 +451,149 @@ pub fn cmd_getdel(
     Ok(old.map(RespValue::BulkString).unwrap_or(RespValue::Null))
 }
 
+/// `GETEX key [EX seconds | PX milliseconds | EXAT unix-time-seconds | PXAT unix-time-milliseconds | PERSIST]`
+pub fn cmd_getex(
+    client: &mut SpiClient,
+    plans: Option<&PreparedPlans>,
+    cache: Option<&L1Cache>,
+    args: &[Bytes],
+) -> SpiResult<RespValue> {
+    if args.len() < 2 {
+        return Ok(RespValue::wrong_arity("getex"));
+    }
+    let key = as_str(&args[1]);
+
+    enum GetExAction {
+        None,
+        Persist,
+        Millis(i64),
+    }
+
+    let mut action = GetExAction::None;
+    let mut opt_set = false;
+    let mut i = 2;
+    while i < args.len() {
+        if opt_set {
+            return Ok(RespValue::syntax_err());
+        }
+        let opt = as_str(&args[i]).to_uppercase();
+        match opt.as_str() {
+            "PERSIST" => {
+                action = GetExAction::Persist;
+                opt_set = true;
+                i += 1;
+            }
+            "EX" => {
+                if i + 1 >= args.len() {
+                    return Ok(RespValue::syntax_err());
+                }
+                let Some(secs) = parse_i64(&args[i + 1]) else {
+                    return Ok(RespValue::not_integer_err());
+                };
+                if secs <= 0 {
+                    return Ok(RespValue::err("ERR invalid expire time in 'getex' command"));
+                }
+                let Some(ms) = secs.checked_mul(1000) else {
+                    return Ok(RespValue::err("ERR invalid expire time in 'getex' command"));
+                };
+                action = GetExAction::Millis(ms);
+                opt_set = true;
+                i += 2;
+            }
+            "PX" => {
+                if i + 1 >= args.len() {
+                    return Ok(RespValue::syntax_err());
+                }
+                let Some(ms) = parse_i64(&args[i + 1]) else {
+                    return Ok(RespValue::not_integer_err());
+                };
+                if ms <= 0 {
+                    return Ok(RespValue::err("ERR invalid expire time in 'getex' command"));
+                }
+                action = GetExAction::Millis(ms);
+                opt_set = true;
+                i += 2;
+            }
+            "EXAT" => {
+                if i + 1 >= args.len() {
+                    return Ok(RespValue::syntax_err());
+                }
+                let Some(ts_secs) = parse_i64(&args[i + 1]) else {
+                    return Ok(RespValue::not_integer_err());
+                };
+                if ts_secs <= 0 {
+                    return Ok(RespValue::err("ERR invalid expire time in 'getex' command"));
+                }
+                let target_ms = ts_secs.saturating_mul(1000);
+                action = GetExAction::Millis(target_ms - now_unix_ms());
+                opt_set = true;
+                i += 2;
+            }
+            "PXAT" => {
+                if i + 1 >= args.len() {
+                    return Ok(RespValue::syntax_err());
+                }
+                let Some(ts_ms) = parse_i64(&args[i + 1]) else {
+                    return Ok(RespValue::not_integer_err());
+                };
+                if ts_ms <= 0 {
+                    return Ok(RespValue::err("ERR invalid expire time in 'getex' command"));
+                }
+                action = GetExAction::Millis(ts_ms - now_unix_ms());
+                opt_set = true;
+                i += 2;
+            }
+            _ => return Ok(RespValue::syntax_err()),
+        }
+    }
+
+    let Some(val) = get_from_db(client, plans, None, &key)? else {
+        return Ok(RespValue::Null);
+    };
+
+    match action {
+        GetExAction::None => {}
+        GetExAction::Persist => {
+            client.update(
+                "UPDATE pg_redis_strings SET expires_at = NULL WHERE key = $1",
+                None,
+                Some(vec![(PgBuiltInOids::TEXTOID.oid(), key.clone().into_datum())]),
+            )?;
+            if let Some(c) = cache {
+                c.insert(key, val.clone(), None);
+            }
+        }
+        GetExAction::Millis(ms) => {
+            if ms <= 0 {
+                client.update(
+                    "DELETE FROM pg_redis_strings WHERE key = $1",
+                    None,
+                    Some(vec![(PgBuiltInOids::TEXTOID.oid(), key.clone().into_datum())]),
+                )?;
+                if let Some(c) = cache {
+                    c.invalidate(&key);
+                }
+            } else {
+                client.update(
+                    "UPDATE pg_redis_strings \
+                     SET expires_at = NOW() + ($2 * INTERVAL '1 millisecond') \
+                     WHERE key = $1",
+                    None,
+                    Some(vec![
+                        (PgBuiltInOids::TEXTOID.oid(), key.clone().into_datum()),
+                        (PgBuiltInOids::INT8OID.oid(), ms.into_datum()),
+                    ]),
+                )?;
+                if let Some(c) = cache {
+                    c.insert(key, val.clone(), Some(Duration::from_millis(ms as u64)));
+                }
+            }
+        }
+    }
+
+    Ok(RespValue::BulkString(val))
+}
+
 pub fn cmd_mget(
     client: &SpiClient,
     plans: Option<&PreparedPlans>,

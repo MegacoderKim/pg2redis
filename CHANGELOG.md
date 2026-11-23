@@ -2,6 +2,20 @@
 
 All notable changes to `pg_redis_core` are documented in this file.
 
+## [0.4.0] - 2026-11-23
+
+### Security & Stability
+- **Sandboxed Lua 5.1 VM (`src/lua.rs`):** Restricted `mlua` to safe standard libraries (`table`, `string`, `math`) and stripped `os`, `io`, `package`, `debug`, `dofile`, `loadfile`, `collectgarbage`, `module`, and `require`. Added configurable instruction-hook execution timeout (`pg_redis.lua_time_limit_ms`, default `5000` ms) to prevent runaway scripts from stalling the background worker.
+- **Real `AUTH` & `HELLO ... AUTH` Enforcement (`pg_redis.requirepass`):** Added `SUPERUSER_ONLY` GUC `pg_redis.requirepass` with constant-time password verification supporting both `AUTH <pass>` and `AUTH default <pass>` as well as `HELLO <proto> AUTH default <pass>`, returning `NOAUTH` / `WRONGPASS` when configured.
+- **Connection & Memory Safeguards:** Added `pg_redis.max_clients` (default `1000`), `pg_redis.max_frame_bytes` (default `64 MiB`), and bounded per-subscriber Pub/Sub queues (`pg_redis.pubsub_queue_size`, default `4096`) with automatic slow-consumer eviction.
+
+### Added
+- **Universal Key Expiration (`pg_redis_key_expiry`):** Extended `EXPIRE`, `PEXPIRE`, `EXPIREAT`, `PEXPIREAT`, `TTL`, `PTTL`, `PERSIST`, and background TTL eviction to work across **all 6 data types** (Strings, Hashes, Lists, Sorted Sets, Sets, and Streams), added Redis 7 `NX` / `XX` / `GT` / `LT` flags, and added `EXPIRETIME` / `PEXPIRETIME`.
+- **Collection Scans & Session Helpers:** Added `HSCAN` (including `MATCH`, `COUNT`, `NOVALUES`), `SSCAN`, `ZSCAN`, fixed `SCAN ... TYPE <type>` filtering, and added `GETEX` (`EX`, `PX`, `EXAT`, `PXAT`, `PERSIST`) for rolling session TTLs (`connect-redis`) and BullMQ `FlowProducer` / dependency pagination.
+- **Multi-Client Registry (`src/clients.rs`):** Upgraded `CLIENT LIST` (with `TYPE` / `ID` filters), `CLIENT INFO`, `CLIENT KILL` (`ID` / `ADDR`), and `INFO` `# Clients` (`connected_clients`, `maxclients`) across all active TCP connections so BullMQ `queue.getWorkers()` and `queue.getQueueEvents()` report live workers.
+- **Pattern Pub/Sub (`src/pubsub.rs`):** Added `PSUBSCRIBE`, `PUNSUBSCRIBE`, `pmessage` push delivery, and live `PUBSUB NUMPAT` counts over the in-process `PubSubHub`.
+- **Upgrade Script:** Added `sql/pg_redis_core--0.3.0--0.4.0.sql` creating `pg_redis_key_expiry`.
+
 ## [0.3.0] - 2026-11-22
 
 ### Added

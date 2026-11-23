@@ -18,9 +18,10 @@ This script verifies all RFC acceptance criteria in sequence:
 4. **Go Integration Suite (`test-go`):** Runs `go-redis/v9` with default RESP3 negotiation across all data types, `ZRangeWithScores`, `Pipeline`, and `TxPipeline`.
 5. **Kotlin Integration Suite (`test-kotlin`):** Runs `Jedis 5.2.0` across Strings, Counters, Hashes, Lists, Sorted Sets, and pipelining.
 6. **BullMQ 5.13.0 Suite (`test-bullmq`):** Runs unmodified `bullmq@5.13.0` covering Lua 5.1 (`EVAL`/`EVALSHA`/`SCRIPT LOAD`/`cjson`/`cmsgpack`), Streams (`XADD`/`XREAD BLOCK`), and cooperative `BZPOPMIN`.
-7. **Pub/Sub Suite (`test-pubsub`):** Runs `ioredis@5.11.1` covering wire-level `SUBSCRIBE`/`UNSUBSCRIBE` acks & counts, Medusa 2.22.7 workflow payloads, multi-subscriber recipient counts, idle concurrency with BullMQ, abrupt disconnect cleanup, auto-resubscribe on reconnect, 100-message FIFO ordering, binary-safe payloads, and 32 KB+ payloads.
-8. **PostgreSQL 15 & 16 DB Isolation Suite (`./tests/test_solar_nest_isolation.sh 15 16`):** Exercises both PG 15 and PG 16 with `pg_redis.database=solar_nest_redis` kept isolated from application DB `solar_nest` alongside `test-pubsub` and `test-bullmq`.
-9. **In-PostgreSQL `pgrx` Unit Tests & `cargo pgrx run` (`dev` target):** Runs `cargo pgrx test pg15` / `pg16` (all 9 `#[pg_test]` cases) and smoke-tests `cargo pgrx run`.
+7. **Pub/Sub & v0.4.0 Suite (`test-pubsub`):** Runs `ioredis@5.11.1` + `bullmq@5.13.0` covering named & pattern Pub/Sub (`SUBSCRIBE`/`PSUBSCRIBE`/`PUBSUB`), universal TTL across all 6 data types (`NX|XX|GT|LT`, `GETEX`), `HSCAN`/`SSCAN`/`ZSCAN`/`SCAN TYPE`, multi-client `CLIENT LIST`/`KILL`, BullMQ `FlowProducer` `getDependencies()` & `getWorkers()`, and Lua sandbox verification.
+8. **v0.4.0 Security & Limits Suite (`./tests/test_v040_security.sh`):** Verifies `pg_redis.requirepass` (`NOAUTH`/`WRONGPASS`/`AUTH`/`HELLO AUTH`/`RESET`), `pg_redis.lua_time_limit_ms` runaway script termination, `pg_redis.max_clients`, and `pg_redis.max_frame_bytes`.
+9. **PostgreSQL 15 & 16 DB Isolation Suite (`./tests/test_solar_nest_isolation.sh 15 16`):** Exercises both PG 15 and PG 16 with `pg_redis.database=solar_nest_redis` kept isolated from application DB `solar_nest` alongside `test-pubsub` and `test-bullmq`.
+10. **In-PostgreSQL `pgrx` Unit Tests & `cargo pgrx run` (`dev` target):** Runs `cargo pgrx test pg15` / `pg16` (all 11 `#[pg_test]` cases) and smoke-tests `cargo pgrx run`.
 
 ## Running `cargo pgrx` Directly via Docker
 
