@@ -2,6 +2,12 @@
 
 All notable changes to `pg_redis_core` are documented in this file.
 
+## [0.4.1] - 2026-11-23
+
+### Fixed
+- **CI / Pub/Sub Test Reliability:** Awaited `ioredis` `ready` state on all Pub/Sub subscriber clients in `tests/clients/pubsub/test_pubsub.mjs` before calling `subscribe()` / `psubscribe()`, eliminating an intermittent `ioredis@5.11.1` `readyCheck` (`INFO`) vs. RESP2 subscribed-mode race.
+- **Upgrade Script:** Added `sql/pg_redis_core--0.4.0--0.4.1.sql`.
+
 ## [0.4.0] - 2026-11-23
 
 ### Security & Stability
