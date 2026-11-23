@@ -115,6 +115,29 @@ class RawRespClient {
   }
 }
 
+function waitReady(client, timeoutMs = 5000) {
+  if (client.status === "ready") return Promise.resolve();
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      client.off("ready", onReady);
+      client.off("error", onError);
+      reject(new Error(`Timed out waiting for ioredis ready (status=${client.status})`));
+    }, timeoutMs);
+    const onReady = () => {
+      clearTimeout(timer);
+      client.off("error", onError);
+      resolve();
+    };
+    const onError = (err) => {
+      clearTimeout(timer);
+      client.off("ready", onReady);
+      reject(err);
+    };
+    client.once("ready", onReady);
+    client.once("error", onError);
+  });
+}
+
 function waitForMessage(client, expectedChannel, timeoutMs = 5000) {
   return new Promise((resolve, reject) => {
     const timer = setTimeout(() => {
@@ -223,6 +246,7 @@ async function runTests() {
     const sub2 = new Redis({ host: REDIS_HOST, port: REDIS_PORT });
     const pub = new Redis({ host: REDIS_HOST, port: REDIS_PORT });
     try {
+      await Promise.all([waitReady(sub1), waitReady(sub2), waitReady(pub)]);
       const wfChannel = "medusa:workflow:create-order:tx_01JMEDUSA001";
       const ch2 = "medusa:workflow:fulfill-order:tx_01JMEDUSA002";
       const ch3 = "medusa:workflow:send-receipt:tx_01JMEDUSA003";
@@ -318,6 +342,7 @@ async function runTests() {
     let worker;
 
     try {
+      await Promise.all([waitReady(idleSub), waitReady(otherClient)]);
       await idleSub.subscribe("medusa:workflow:idle");
       // Verify normal Redis commands work immediately while idleSub is subscribed
       assert.equal(await otherClient.set("coexist:key", "alive"), "OK");
@@ -375,6 +400,7 @@ async function runTests() {
       retryStrategy: () => 50,
     });
     try {
+      await Promise.all([waitReady(pub), waitReady(subDrop), waitReady(subReconn)]);
       // Abrupt socket destruction -> subscription must be cleaned up promptly
       await subDrop.subscribe("medusa:disconnect-cleanup");
       assert.equal(await pub.publish("medusa:disconnect-cleanup", "before-drop"), 1);
@@ -420,6 +446,7 @@ async function runTests() {
     const sub = new Redis({ host: REDIS_HOST, port: REDIS_PORT });
     const pub = new Redis({ host: REDIS_HOST, port: REDIS_PORT });
     try {
+      await Promise.all([waitReady(sub), waitReady(pub)]);
       const ch = "medusa:ordering";
       await sub.subscribe(ch);
       const total = 100;
@@ -470,6 +497,7 @@ async function runTests() {
     const sub = new Redis({ host: REDIS_HOST, port: REDIS_PORT });
     const pub = new Redis({ host: REDIS_HOST, port: REDIS_PORT });
     try {
+      await Promise.all([waitReady(sub), waitReady(pub)]);
       // Binary payload with NUL bytes, non-UTF8 octets, and RESP control characters
       const binCh = "medusa:binary";
       await sub.subscribe(binCh);
@@ -517,6 +545,7 @@ async function runTests() {
     const sub = new Redis({ host: REDIS_HOST, port: REDIS_PORT });
     const pub = new Redis({ host: REDIS_HOST, port: REDIS_PORT });
     try {
+      await Promise.all([waitReady(sub), waitReady(pub)]);
       const ch = "medusa:lua-and-multi";
       await sub.subscribe(ch);
 
@@ -557,6 +586,7 @@ async function runTests() {
     const pub = new Redis({ host: REDIS_HOST, port: REDIS_PORT });
     const raw = await RawRespClient.connect(REDIS_HOST, REDIS_PORT);
     try {
+      await Promise.all([waitReady(psub), waitReady(pub)]);
       // Wire-level PSUBSCRIBE + mixed SUBSCRIBE count + idempotent duplicate
       raw.send("PSUBSCRIBE", "orders.*", "orders.*", "billing:*");
       assert.deepEqual(await raw.nextFrame(), ["psubscribe", "orders.*", { type: ":", value: 1 }]);
