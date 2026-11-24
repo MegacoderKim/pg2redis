@@ -44,6 +44,8 @@ pub static TLS_CA_CERT_FILE: GucSetting<Option<&'static CStr>> =
 pub static TLS_AUTH_CLIENTS: GucSetting<Option<&'static CStr>> =
     GucSetting::<Option<&'static CStr>>::new(Some(c"no"));
 
+pub static DATABASES: GucSetting<i32> = GucSetting::<i32>::new(16);
+
 pub fn register_gucs(in_shared_preload: bool) {
     // PostgreSQL forbids defining PGC_POSTMASTER GUCs after server startup (e.g., when
     // `CREATE EXTENSION pg_redis_core` is run without `shared_preload_libraries`).
@@ -234,6 +236,17 @@ pub fn register_gucs(in_shared_preload: bool) {
         GucContext::Sighup,
         GucFlags::SUPERUSER_ONLY,
     );
+
+    GucRegistry::define_int_guc(
+        "pg_redis.databases",
+        "Number of logical Redis databases available via SELECT (0 .. databases-1).",
+        "Defaults to 16 (matching standard Redis).",
+        &DATABASES,
+        1,
+        1024,
+        GucContext::Sighup,
+        GucFlags::default(),
+    );
 }
 
 pub fn bind_address() -> String {
@@ -347,4 +360,8 @@ pub fn tls_auth_clients() -> String {
         .filter(|s| !s.is_empty())
         .map(|s| s.to_ascii_lowercase())
         .unwrap_or_else(|| "no".to_string())
+}
+
+pub fn databases() -> i64 {
+    DATABASES.get().clamp(1, 1024) as i64
 }

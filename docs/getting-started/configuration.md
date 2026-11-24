@@ -13,6 +13,7 @@ max_worker_processes = 16
 pg_redis.bind_address = '0.0.0.0'
 pg_redis.port = 6379
 pg_redis.database = 'postgres'
+pg_redis.databases = 16
 pg_redis.unlogged = off
 pg_redis.cache_enabled = on
 pg_redis.cache_capacity = 10000
@@ -47,6 +48,7 @@ pg_redis.tls_port = 0
 | `pg_redis.tls_ca_cert_file` | `text` | *(unset)* | SIGHUP (`SUPERUSER_ONLY`) | Optional path to PEM CA bundle for mTLS client certificate verification. |
 | `pg_redis.tls_auth_clients` | `text` | `'no'` | SIGHUP (`SUPERUSER_ONLY`) | mTLS policy: `'no'` (default), `'optional'`, or `'yes'` (require valid CA-signed client cert). |
 | `pg_redis.database` | `text` | `'postgres'` | Postmaster | Target PostgreSQL database connected by the background worker via SPI. |
+| `pg_redis.databases` | `integer` | `16` | SIGHUP | Number of logical Redis databases available via `SELECT` (`1`–`1024`; indices `0`..`N-1`). |
 | `pg_redis.unlogged` | `boolean` | `off` | SIGHUP | When `on`, auto-provisioned catalog tables are created as `UNLOGGED` to bypass WAL. |
 | `pg_redis.cache_enabled` | `boolean` | `on` | SIGHUP | Enables the in-process `moka` L1 hot-key cache for `GET` reads. |
 | `pg_redis.cache_capacity` | `integer` | `10000` | Postmaster | Maximum number of entries retained in the L1 hot-key cache (`0`–`10000000`). |
@@ -89,7 +91,7 @@ Create the database and enable the extension inside it (`CREATE DATABASE app_red
 
 ## Upgrading Between Extension Versions
 
-`pg_redis_core` ships incremental SQL upgrade scripts (`sql/pg_redis_core--0.1.0--0.2.0.sql`, `0.2.0--0.3.0.sql`, `0.3.0--0.4.0.sql`, `0.4.0--0.4.1.sql`, `0.4.1--0.5.0.sql`). After installing a newer extension package or image, run:
+`pg_redis_core` ships incremental SQL upgrade scripts (`sql/pg_redis_core--0.1.0--0.2.0.sql`, `0.2.0--0.3.0.sql`, `0.3.0--0.4.0.sql`, `0.4.0--0.4.1.sql`, `0.4.1--0.5.0.sql`, `0.5.0--0.6.0.sql`). After installing a newer extension package or image, run:
 
 ```sql
 ALTER EXTENSION pg_redis_core UPDATE;

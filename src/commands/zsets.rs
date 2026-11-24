@@ -77,8 +77,9 @@ fn score_matches_bounds(score: f64, min: ScoreBound, max: ScoreBound) -> bool {
 pub fn cmd_zadd(
     client: &mut SpiClient,
     plans: Option<&PreparedPlans>,
+    db: i16,
     args: &[Bytes],
-    mutated_keys: &mut Vec<String>,
+    mutated_keys: &mut Vec<(i16, String)>,
 ) -> SpiResult<RespValue> {
     if args.len() < 4 {
         return Ok(RespValue::wrong_arity("zadd"));
@@ -154,13 +155,13 @@ pub fn cmd_zadd(
         items.push((score, as_str(&pair[1])));
     }
 
-    keys::purge_if_expired_non_string(client, &key)?;
+    keys::purge_if_expired_non_string(client, db, &key)?;
 
     let mut added_count: i64 = 0;
     let mut changed_count: i64 = 0;
 
     for (score_arg, member) in items {
-        let existing_score = get_member_score(client, plans, &key, &member)?;
+        let existing_score = get_member_score(client, plans, db, &key, &member)?;
         match existing_score {
             None => {
                 if xx {
@@ -170,10 +171,11 @@ pub fn cmd_zadd(
                     continue;
                 }
                 client.update(
-                    "INSERT INTO pg_redis_zsets (key, member, score) VALUES ($1, $2, $3) \
-                     ON CONFLICT (key, member) DO UPDATE SET score = EXCLUDED.score",
+                    "INSERT INTO pg_redis_zsets (db, key, member, score) VALUES ($1, $2, $3, $4) \
+                     ON CONFLICT (db, key, member) DO UPDATE SET score = EXCLUDED.score",
                     None,
                     Some(vec![
+                        (PgBuiltInOids::INT2OID.oid(), db.into_datum()),
                         (PgBuiltInOids::TEXTOID.oid(), key.clone().into_datum()),
                         (PgBuiltInOids::TEXTOID.oid(), member.into_datum()),
                         (PgBuiltInOids::FLOAT8OID.oid(), score_arg.into_datum()),
@@ -182,7 +184,7 @@ pub fn cmd_zadd(
                 added_count += 1;
                 changed_count += 1;
                 if incr {
-                    mutated_keys.push(key);
+                    mutated_keys.push((db, key));
                     return Ok(RespValue::Double(score_arg));
                 }
             }
@@ -220,9 +222,10 @@ pub fn cmd_zadd(
 
                 if new_score != old_score {
                     client.update(
-                        "UPDATE pg_redis_zsets SET score = $3 WHERE key = $1 AND member = $2",
+                        "UPDATE pg_redis_zsets SET score = $4 WHERE db = $1 AND key = $2 AND member = $3",
                         None,
                         Some(vec![
+                            (PgBuiltInOids::INT2OID.oid(), db.into_datum()),
                             (PgBuiltInOids::TEXTOID.oid(), key.clone().into_datum()),
                             (PgBuiltInOids::TEXTOID.oid(), member.into_datum()),
                             (PgBuiltInOids::FLOAT8OID.oid(), new_score.into_datum()),
@@ -232,7 +235,7 @@ pub fn cmd_zadd(
                 }
 
                 if incr {
-                    mutated_keys.push(key);
+                    mutated_keys.push((db, key));
                     return Ok(RespValue::Double(new_score));
                 }
             }
@@ -240,7 +243,7 @@ pub fn cmd_zadd(
     }
 
     if changed_count > 0 || added_count > 0 {
-        mutated_keys.push(key);
+        mutated_keys.push((db, key));
     }
 
     Ok(RespValue::Integer(if ch {
@@ -253,6 +256,7 @@ pub fn cmd_zadd(
 fn get_member_score(
     client: &SpiClient,
     plans: Option<&PreparedPlans>,
+    db: i16,
     key: &str,
     member: &str,
 ) -> SpiResult<Option<f64>> {
@@ -260,12 +264,13 @@ fn get_member_score(
         Some(p) => client.select(
             &p.zset_score,
             None,
-            Some(vec![key.into_datum(), member.into_datum()]),
+            Some(vec![db.into_datum(), key.into_datum(), member.into_datum()]),
         )?,
         None => client.select(
             SQL_ZSET_SCORE,
             None,
             Some(vec![
+                (PgBuiltInOids::INT2OID.oid(), db.into_datum()),
                 (PgBuiltInOids::TEXTOID.oid(), key.into_datum()),
                 (PgBuiltInOids::TEXTOID.oid(), member.into_datum()),
             ]),
@@ -280,6 +285,7 @@ fn get_member_score(
 pub fn cmd_zscore(
     client: &SpiClient,
     plans: Option<&PreparedPlans>,
+    db: i16,
     args: &[Bytes],
 ) -> SpiResult<RespValue> {
     if args.len() != 3 {
@@ -287,21 +293,21 @@ pub fn cmd_zscore(
     }
     let key = as_str(&args[1]);
     let member = as_str(&args[2]);
-    if keys::is_non_string_expired(client, &key)? {
+    if keys::is_non_string_expired(client, db, &key)? {
         return Ok(RespValue::Null);
     }
-    match get_member_score(client, plans, &key, &member)? {
+    match get_member_score(client, plans, db, &key, &member)? {
         Some(s) => Ok(RespValue::Double(s)),
         None => Ok(RespValue::Null),
     }
 }
 
-pub fn cmd_zrem(client: &mut SpiClient, args: &[Bytes]) -> SpiResult<RespValue> {
+pub fn cmd_zrem(client: &mut SpiClient, db: i16, args: &[Bytes]) -> SpiResult<RespValue> {
     if args.len() < 3 {
         return Ok(RespValue::wrong_arity("zrem"));
     }
     let key = as_str(&args[1]);
-    if keys::purge_if_expired_non_string(client, &key)? {
+    if keys::purge_if_expired_non_string(client, db, &key)? {
         return Ok(RespValue::Integer(0));
     }
     let mut removed: i64 = 0;
@@ -309,9 +315,10 @@ pub fn cmd_zrem(client: &mut SpiClient, args: &[Bytes]) -> SpiResult<RespValue> 
     for raw_member in &args[2..] {
         let member = as_str(raw_member);
         let res = client.update(
-            "DELETE FROM pg_redis_zsets WHERE key = $1 AND member = $2",
+            "DELETE FROM pg_redis_zsets WHERE db = $1 AND key = $2 AND member = $3",
             None,
             Some(vec![
+                (PgBuiltInOids::INT2OID.oid(), db.into_datum()),
                 (PgBuiltInOids::TEXTOID.oid(), key.clone().into_datum()),
                 (PgBuiltInOids::TEXTOID.oid(), member.into_datum()),
             ]),
@@ -320,25 +327,28 @@ pub fn cmd_zrem(client: &mut SpiClient, args: &[Bytes]) -> SpiResult<RespValue> 
     }
 
     if removed > 0 {
-        keys::cleanup_expiry_if_empty(client, "pg_redis_zsets", &key)?;
+        keys::cleanup_expiry_if_empty(client, "pg_redis_zsets", db, &key)?;
     }
 
     Ok(RespValue::Integer(removed))
 }
 
-pub fn cmd_zcard(client: &SpiClient, args: &[Bytes]) -> SpiResult<RespValue> {
+pub fn cmd_zcard(client: &SpiClient, db: i16, args: &[Bytes]) -> SpiResult<RespValue> {
     if args.len() != 2 {
         return Ok(RespValue::wrong_arity("zcard"));
     }
     let key = as_str(&args[1]);
-    if keys::is_non_string_expired(client, &key)? {
+    if keys::is_non_string_expired(client, db, &key)? {
         return Ok(RespValue::Integer(0));
     }
     let count = client
         .select(
-            "SELECT COUNT(*)::BIGINT FROM pg_redis_zsets WHERE key = $1",
+            "SELECT COUNT(*)::BIGINT FROM pg_redis_zsets WHERE db = $1 AND key = $2",
             None,
-            Some(vec![(PgBuiltInOids::TEXTOID.oid(), key.into_datum())]),
+            Some(vec![
+                (PgBuiltInOids::INT2OID.oid(), db.into_datum()),
+                (PgBuiltInOids::TEXTOID.oid(), key.into_datum()),
+            ]),
         )?
         .first()
         .get_one::<i64>()?
@@ -346,7 +356,7 @@ pub fn cmd_zcard(client: &SpiClient, args: &[Bytes]) -> SpiResult<RespValue> {
     Ok(RespValue::Integer(count))
 }
 
-pub fn cmd_zrank(client: &SpiClient, args: &[Bytes], rev: bool) -> SpiResult<RespValue> {
+pub fn cmd_zrank(client: &SpiClient, db: i16, args: &[Bytes], rev: bool) -> SpiResult<RespValue> {
     let name = if rev { "zrevrank" } else { "zrank" };
     if args.len() < 3 || args.len() > 4 {
         return Ok(RespValue::wrong_arity(name));
@@ -363,7 +373,7 @@ pub fn cmd_zrank(client: &SpiClient, args: &[Bytes], rev: bool) -> SpiResult<Res
 
     let key = as_str(&args[1]);
     let member = as_str(&args[2]);
-    if keys::is_non_string_expired(client, &key)? {
+    if keys::is_non_string_expired(client, db, &key)? {
         return Ok(RespValue::Null);
     }
     let order = if rev {
@@ -375,14 +385,15 @@ pub fn cmd_zrank(client: &SpiClient, args: &[Bytes], rev: bool) -> SpiResult<Res
     let sql = format!(
         "SELECT rn - 1, score FROM ( \
             SELECT member, score, ROW_NUMBER() OVER (ORDER BY {order})::BIGINT AS rn \
-            FROM pg_redis_zsets WHERE key = $1 \
-         ) ranked WHERE member = $2"
+            FROM pg_redis_zsets WHERE db = $1 AND key = $2 \
+         ) ranked WHERE member = $3"
     );
 
     let table = client.select(
         &sql,
         None,
         Some(vec![
+            (PgBuiltInOids::INT2OID.oid(), db.into_datum()),
             (PgBuiltInOids::TEXTOID.oid(), key.into_datum()),
             (PgBuiltInOids::TEXTOID.oid(), member.into_datum()),
         ]),
@@ -409,8 +420,9 @@ pub fn cmd_zrank(client: &SpiClient, args: &[Bytes], rev: bool) -> SpiResult<Res
 pub fn cmd_zincrby(
     client: &mut SpiClient,
     plans: Option<&PreparedPlans>,
+    db: i16,
     args: &[Bytes],
-    mutated_keys: &mut Vec<String>,
+    mutated_keys: &mut Vec<(i16, String)>,
 ) -> SpiResult<RespValue> {
     if args.len() != 4 {
         return Ok(RespValue::wrong_arity("zincrby"));
@@ -420,30 +432,36 @@ pub fn cmd_zincrby(
         return Ok(RespValue::not_float_err());
     };
     let member = as_str(&args[3]);
-    keys::purge_if_expired_non_string(client, &key)?;
+    keys::purge_if_expired_non_string(client, db, &key)?;
 
-    let current = get_member_score(client, plans, &key, &member)?.unwrap_or(0.0);
+    let current = get_member_score(client, plans, db, &key, &member)?.unwrap_or(0.0);
     let next = current + inc;
     if next.is_nan() {
         return Ok(RespValue::err("ERR resulting score is not a number (NaN)"));
     }
 
     client.update(
-        "INSERT INTO pg_redis_zsets (key, member, score) VALUES ($1, $2, $3) \
-         ON CONFLICT (key, member) DO UPDATE SET score = EXCLUDED.score",
+        "INSERT INTO pg_redis_zsets (db, key, member, score) VALUES ($1, $2, $3, $4) \
+         ON CONFLICT (db, key, member) DO UPDATE SET score = EXCLUDED.score",
         None,
         Some(vec![
+            (PgBuiltInOids::INT2OID.oid(), db.into_datum()),
             (PgBuiltInOids::TEXTOID.oid(), key.clone().into_datum()),
             (PgBuiltInOids::TEXTOID.oid(), member.into_datum()),
             (PgBuiltInOids::FLOAT8OID.oid(), next.into_datum()),
         ]),
     )?;
 
-    mutated_keys.push(key);
+    mutated_keys.push((db, key));
     Ok(RespValue::Double(next))
 }
 
-pub fn cmd_zrange(client: &SpiClient, args: &[Bytes], force_rev: bool) -> SpiResult<RespValue> {
+pub fn cmd_zrange(
+    client: &SpiClient,
+    db: i16,
+    args: &[Bytes],
+    force_rev: bool,
+) -> SpiResult<RespValue> {
     let name = if force_rev { "zrevrange" } else { "zrange" };
     if args.len() < 4 {
         return Ok(RespValue::wrong_arity(name));
@@ -494,7 +512,9 @@ pub fn cmd_zrange(client: &SpiClient, args: &[Bytes], force_rev: bool) -> SpiRes
         } else {
             (&args[2], &args[3])
         };
-        return query_zrange_by_score(client, &key, min_raw, max_raw, rev, withscores, limit_opt);
+        return query_zrange_by_score(
+            client, db, &key, min_raw, max_raw, rev, withscores, limit_opt,
+        );
     }
 
     let Some(mut start) = parse_i64(&args[2]) else {
@@ -504,7 +524,7 @@ pub fn cmd_zrange(client: &SpiClient, args: &[Bytes], force_rev: bool) -> SpiRes
         return Ok(RespValue::not_integer_err());
     };
 
-    if keys::is_non_string_expired(client, &key)? {
+    if keys::is_non_string_expired(client, db, &key)? {
         return Ok(if withscores {
             RespValue::ScoredArray(Vec::new())
         } else {
@@ -514,9 +534,12 @@ pub fn cmd_zrange(client: &SpiClient, args: &[Bytes], force_rev: bool) -> SpiRes
 
     let len = client
         .select(
-            "SELECT COUNT(*)::BIGINT FROM pg_redis_zsets WHERE key = $1",
+            "SELECT COUNT(*)::BIGINT FROM pg_redis_zsets WHERE db = $1 AND key = $2",
             None,
-            Some(vec![(PgBuiltInOids::TEXTOID.oid(), key.clone().into_datum())]),
+            Some(vec![
+                (PgBuiltInOids::INT2OID.oid(), db.into_datum()),
+                (PgBuiltInOids::TEXTOID.oid(), key.clone().into_datum()),
+            ]),
         )?
         .first()
         .get_one::<i64>()?
@@ -555,15 +578,16 @@ pub fn cmd_zrange(client: &SpiClient, args: &[Bytes], force_rev: bool) -> SpiRes
     };
     let sql = format!(
         "SELECT member, score FROM pg_redis_zsets \
-         WHERE key = $1 \
+         WHERE db = $1 AND key = $2 \
          ORDER BY {order} \
-         OFFSET $2 LIMIT $3"
+         OFFSET $3 LIMIT $4"
     );
 
     let table = client.select(
         &sql,
         None,
         Some(vec![
+            (PgBuiltInOids::INT2OID.oid(), db.into_datum()),
             (PgBuiltInOids::TEXTOID.oid(), key.into_datum()),
             (PgBuiltInOids::INT8OID.oid(), start.into_datum()),
             (PgBuiltInOids::INT8OID.oid(), count.into_datum()),
@@ -575,6 +599,7 @@ pub fn cmd_zrange(client: &SpiClient, args: &[Bytes], force_rev: bool) -> SpiRes
 
 pub fn cmd_zrangebyscore(
     client: &SpiClient,
+    db: i16,
     args: &[Bytes],
     rev: bool,
 ) -> SpiResult<RespValue> {
@@ -622,11 +647,15 @@ pub fn cmd_zrangebyscore(
         }
     }
 
-    query_zrange_by_score(client, &key, min_raw, max_raw, rev, withscores, limit_opt)
+    query_zrange_by_score(
+        client, db, &key, min_raw, max_raw, rev, withscores, limit_opt,
+    )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn query_zrange_by_score(
     client: &SpiClient,
+    db: i16,
     key: &str,
     min_raw: &Bytes,
     max_raw: &Bytes,
@@ -641,7 +670,7 @@ fn query_zrange_by_score(
         return Ok(RespValue::err("ERR min or max is not a float"));
     };
 
-    if keys::is_non_string_expired(client, key)? {
+    if keys::is_non_string_expired(client, db, key)? {
         return Ok(if withscores {
             RespValue::ScoredArray(Vec::new())
         } else {
@@ -655,13 +684,16 @@ fn query_zrange_by_score(
         "score ASC, member ASC"
     };
     let sql = format!(
-        "SELECT member, score FROM pg_redis_zsets WHERE key = $1 ORDER BY {order}"
+        "SELECT member, score FROM pg_redis_zsets WHERE db = $1 AND key = $2 ORDER BY {order}"
     );
 
     let table = client.select(
         &sql,
         None,
-        Some(vec![(PgBuiltInOids::TEXTOID.oid(), key.into_datum())]),
+        Some(vec![
+            (PgBuiltInOids::INT2OID.oid(), db.into_datum()),
+            (PgBuiltInOids::TEXTOID.oid(), key.into_datum()),
+        ]),
     )?;
 
     let mut matched: Vec<(Bytes, f64)> = Vec::new();
@@ -700,7 +732,7 @@ fn query_zrange_by_score(
     }
 }
 
-pub fn cmd_zcount(client: &SpiClient, args: &[Bytes]) -> SpiResult<RespValue> {
+pub fn cmd_zcount(client: &SpiClient, db: i16, args: &[Bytes]) -> SpiResult<RespValue> {
     if args.len() != 4 {
         return Ok(RespValue::wrong_arity("zcount"));
     }
@@ -712,14 +744,17 @@ pub fn cmd_zcount(client: &SpiClient, args: &[Bytes]) -> SpiResult<RespValue> {
         return Ok(RespValue::err("ERR min or max is not a float"));
     };
 
-    if keys::is_non_string_expired(client, &key)? {
+    if keys::is_non_string_expired(client, db, &key)? {
         return Ok(RespValue::Integer(0));
     }
 
     let table = client.select(
-        "SELECT score FROM pg_redis_zsets WHERE key = $1",
+        "SELECT score FROM pg_redis_zsets WHERE db = $1 AND key = $2",
         None,
-        Some(vec![(PgBuiltInOids::TEXTOID.oid(), key.into_datum())]),
+        Some(vec![
+            (PgBuiltInOids::INT2OID.oid(), db.into_datum()),
+            (PgBuiltInOids::TEXTOID.oid(), key.into_datum()),
+        ]),
     )?;
 
     let mut count: i64 = 0;
@@ -755,7 +790,12 @@ fn format_zset_rows(
 }
 
 /// `ZPOPMIN key [count]` / `ZPOPMAX key [count]`
-pub fn cmd_zpop(client: &mut SpiClient, args: &[Bytes], is_max: bool) -> SpiResult<RespValue> {
+pub fn cmd_zpop(
+    client: &mut SpiClient,
+    db: i16,
+    args: &[Bytes],
+    is_max: bool,
+) -> SpiResult<RespValue> {
     let name = if is_max { "zpopmax" } else { "zpopmin" };
     if args.len() < 2 || args.len() > 3 {
         return Ok(RespValue::wrong_arity(name));
@@ -773,7 +813,7 @@ pub fn cmd_zpop(client: &mut SpiClient, args: &[Bytes], is_max: bool) -> SpiResu
         1
     };
 
-    if keys::purge_if_expired_non_string(client, &key)? || count == 0 {
+    if keys::purge_if_expired_non_string(client, db, &key)? || count == 0 {
         return Ok(RespValue::ScoredArray(Vec::new()));
     }
 
@@ -785,11 +825,11 @@ pub fn cmd_zpop(client: &mut SpiClient, args: &[Bytes], is_max: bool) -> SpiResu
 
     let sql = format!(
         "WITH popped AS ( \
-            SELECT key, member, score FROM pg_redis_zsets \
-            WHERE key = $1 ORDER BY {order} LIMIT $2 \
+            SELECT db, key, member, score FROM pg_redis_zsets \
+            WHERE db = $1 AND key = $2 ORDER BY {order} LIMIT $3 \
         ) \
         DELETE FROM pg_redis_zsets z USING popped p \
-        WHERE z.key = p.key AND z.member = p.member \
+        WHERE z.db = p.db AND z.key = p.key AND z.member = p.member \
         RETURNING z.member, z.score"
     );
 
@@ -797,6 +837,7 @@ pub fn cmd_zpop(client: &mut SpiClient, args: &[Bytes], is_max: bool) -> SpiResu
         &sql,
         None,
         Some(vec![
+            (PgBuiltInOids::INT2OID.oid(), db.into_datum()),
             (PgBuiltInOids::TEXTOID.oid(), key.clone().into_datum()),
             (PgBuiltInOids::INT8OID.oid(), count.into_datum()),
         ]),
@@ -810,7 +851,7 @@ pub fn cmd_zpop(client: &mut SpiClient, args: &[Bytes], is_max: bool) -> SpiResu
     }
 
     if !pairs.is_empty() {
-        keys::cleanup_expiry_if_empty(client, "pg_redis_zsets", &key)?;
+        keys::cleanup_expiry_if_empty(client, "pg_redis_zsets", db, &key)?;
     }
 
     if is_max {
@@ -830,10 +871,11 @@ pub fn cmd_zpop(client: &mut SpiClient, args: &[Bytes], is_max: bool) -> SpiResu
     Ok(RespValue::ScoredArray(pairs))
 }
 
-/// Non-blocking single pop across multiple keys used by `BZPOPMIN` / `BZPOPMAX`.
+/// Non-blocking single pop across multiple keys in `db` used by `BZPOPMIN` / `BZPOPMAX`.
 /// Returns `Ok(Some([key, member, score]))` on hit, or `Ok(None)` if all keys are empty.
 pub fn try_bzpop_once(
     client: &mut SpiClient,
+    db: i16,
     keys: &[String],
     is_max: bool,
 ) -> SpiResult<Option<RespValue>> {
@@ -845,28 +887,31 @@ pub fn try_bzpop_once(
 
     let sql = format!(
         "WITH popped AS ( \
-            SELECT key, member, score FROM pg_redis_zsets \
-            WHERE key = $1 ORDER BY {order} LIMIT 1 \
+            SELECT db, key, member, score FROM pg_redis_zsets \
+            WHERE db = $1 AND key = $2 ORDER BY {order} LIMIT 1 \
         ) \
         DELETE FROM pg_redis_zsets z USING popped p \
-        WHERE z.key = p.key AND z.member = p.member \
+        WHERE z.db = p.db AND z.key = p.key AND z.member = p.member \
         RETURNING z.member, z.score"
     );
 
     for key in keys {
-        if keys::purge_if_expired_non_string(client, key)? {
+        if keys::purge_if_expired_non_string(client, db, key)? {
             continue;
         }
         let table = client.update(
             &sql,
             None,
-            Some(vec![(PgBuiltInOids::TEXTOID.oid(), key.clone().into_datum())]),
+            Some(vec![
+                (PgBuiltInOids::INT2OID.oid(), db.into_datum()),
+                (PgBuiltInOids::TEXTOID.oid(), key.clone().into_datum()),
+            ]),
         )?;
         if !table.is_empty() {
             let row = table.first();
             let member: String = row.get(1)?.unwrap_or_default();
             let score: f64 = row.get(2)?.unwrap_or(0.0);
-            keys::cleanup_expiry_if_empty(client, "pg_redis_zsets", key)?;
+            keys::cleanup_expiry_if_empty(client, "pg_redis_zsets", db, key)?;
             return Ok(Some(RespValue::Array(vec![
                 RespValue::bulk(key.clone()),
                 RespValue::bulk(member),
@@ -879,7 +924,7 @@ pub fn try_bzpop_once(
 }
 
 /// `ZREMRANGEBYRANK key start stop`
-pub fn cmd_zremrangebyrank(client: &mut SpiClient, args: &[Bytes]) -> SpiResult<RespValue> {
+pub fn cmd_zremrangebyrank(client: &mut SpiClient, db: i16, args: &[Bytes]) -> SpiResult<RespValue> {
     if args.len() != 4 {
         return Ok(RespValue::wrong_arity("zremrangebyrank"));
     }
@@ -891,15 +936,18 @@ pub fn cmd_zremrangebyrank(client: &mut SpiClient, args: &[Bytes]) -> SpiResult<
         return Ok(RespValue::not_integer_err());
     };
 
-    if keys::purge_if_expired_non_string(client, &key)? {
+    if keys::purge_if_expired_non_string(client, db, &key)? {
         return Ok(RespValue::Integer(0));
     }
 
     let len = client
         .select(
-            "SELECT COUNT(*)::BIGINT FROM pg_redis_zsets WHERE key = $1",
+            "SELECT COUNT(*)::BIGINT FROM pg_redis_zsets WHERE db = $1 AND key = $2",
             None,
-            Some(vec![(PgBuiltInOids::TEXTOID.oid(), key.clone().into_datum())]),
+            Some(vec![
+                (PgBuiltInOids::INT2OID.oid(), db.into_datum()),
+                (PgBuiltInOids::TEXTOID.oid(), key.clone().into_datum()),
+            ]),
         )?
         .first()
         .get_one::<i64>()?
@@ -925,14 +973,15 @@ pub fn cmd_zremrangebyrank(client: &mut SpiClient, args: &[Bytes]) -> SpiResult<
     let count = stop - start + 1;
     let res = client.update(
         "WITH target AS ( \
-            SELECT key, member FROM pg_redis_zsets \
-            WHERE key = $1 ORDER BY score ASC, member ASC \
-            OFFSET $2 LIMIT $3 \
+            SELECT db, key, member FROM pg_redis_zsets \
+            WHERE db = $1 AND key = $2 ORDER BY score ASC, member ASC \
+            OFFSET $3 LIMIT $4 \
         ) \
         DELETE FROM pg_redis_zsets z USING target t \
-        WHERE z.key = t.key AND z.member = t.member",
+        WHERE z.db = t.db AND z.key = t.key AND z.member = t.member",
         None,
         Some(vec![
+            (PgBuiltInOids::INT2OID.oid(), db.into_datum()),
             (PgBuiltInOids::TEXTOID.oid(), key.clone().into_datum()),
             (PgBuiltInOids::INT8OID.oid(), start.into_datum()),
             (PgBuiltInOids::INT8OID.oid(), count.into_datum()),
@@ -941,14 +990,18 @@ pub fn cmd_zremrangebyrank(client: &mut SpiClient, args: &[Bytes]) -> SpiResult<
 
     let removed = res.len() as i64;
     if removed > 0 {
-        keys::cleanup_expiry_if_empty(client, "pg_redis_zsets", &key)?;
+        keys::cleanup_expiry_if_empty(client, "pg_redis_zsets", db, &key)?;
     }
 
     Ok(RespValue::Integer(removed))
 }
 
 /// `ZREMRANGEBYSCORE key min max`
-pub fn cmd_zremrangebyscore(client: &mut SpiClient, args: &[Bytes]) -> SpiResult<RespValue> {
+pub fn cmd_zremrangebyscore(
+    client: &mut SpiClient,
+    db: i16,
+    args: &[Bytes],
+) -> SpiResult<RespValue> {
     if args.len() != 4 {
         return Ok(RespValue::wrong_arity("zremrangebyscore"));
     }
@@ -960,14 +1013,17 @@ pub fn cmd_zremrangebyscore(client: &mut SpiClient, args: &[Bytes]) -> SpiResult
         return Ok(RespValue::err("ERR min or max is not a float"));
     };
 
-    if keys::purge_if_expired_non_string(client, &key)? {
+    if keys::purge_if_expired_non_string(client, db, &key)? {
         return Ok(RespValue::Integer(0));
     }
 
     let table = client.select(
-        "SELECT member, score FROM pg_redis_zsets WHERE key = $1",
+        "SELECT member, score FROM pg_redis_zsets WHERE db = $1 AND key = $2",
         None,
-        Some(vec![(PgBuiltInOids::TEXTOID.oid(), key.clone().into_datum())]),
+        Some(vec![
+            (PgBuiltInOids::INT2OID.oid(), db.into_datum()),
+            (PgBuiltInOids::TEXTOID.oid(), key.clone().into_datum()),
+        ]),
     )?;
 
     let mut to_remove = Vec::new();
@@ -982,9 +1038,10 @@ pub fn cmd_zremrangebyscore(client: &mut SpiClient, args: &[Bytes]) -> SpiResult
     let mut removed: i64 = 0;
     for member in to_remove {
         let res = client.update(
-            "DELETE FROM pg_redis_zsets WHERE key = $1 AND member = $2",
+            "DELETE FROM pg_redis_zsets WHERE db = $1 AND key = $2 AND member = $3",
             None,
             Some(vec![
+                (PgBuiltInOids::INT2OID.oid(), db.into_datum()),
                 (PgBuiltInOids::TEXTOID.oid(), key.clone().into_datum()),
                 (PgBuiltInOids::TEXTOID.oid(), member.into_datum()),
             ]),
@@ -993,14 +1050,14 @@ pub fn cmd_zremrangebyscore(client: &mut SpiClient, args: &[Bytes]) -> SpiResult
     }
 
     if removed > 0 {
-        keys::cleanup_expiry_if_empty(client, "pg_redis_zsets", &key)?;
+        keys::cleanup_expiry_if_empty(client, "pg_redis_zsets", db, &key)?;
     }
 
     Ok(RespValue::Integer(removed))
 }
 
 /// `ZSCAN key cursor [MATCH pattern] [COUNT count]`
-pub fn cmd_zscan(client: &SpiClient, args: &[Bytes]) -> SpiResult<RespValue> {
+pub fn cmd_zscan(client: &SpiClient, db: i16, args: &[Bytes]) -> SpiResult<RespValue> {
     if args.len() < 3 {
         return Ok(RespValue::wrong_arity("zscan"));
     }
@@ -1043,7 +1100,7 @@ pub fn cmd_zscan(client: &SpiClient, args: &[Bytes]) -> SpiResult<RespValue> {
         }
     }
 
-    if keys::is_non_string_expired(client, &key)? {
+    if keys::is_non_string_expired(client, db, &key)? {
         return Ok(RespValue::Array(vec![
             RespValue::bulk("0"),
             RespValue::Array(Vec::new()),
@@ -1051,9 +1108,12 @@ pub fn cmd_zscan(client: &SpiClient, args: &[Bytes]) -> SpiResult<RespValue> {
     }
 
     let table = client.select(
-        "SELECT member, score FROM pg_redis_zsets WHERE key = $1 ORDER BY score ASC, member ASC",
+        "SELECT member, score FROM pg_redis_zsets WHERE db = $1 AND key = $2 ORDER BY score ASC, member ASC",
         None,
-        Some(vec![(PgBuiltInOids::TEXTOID.oid(), key.into_datum())]),
+        Some(vec![
+            (PgBuiltInOids::INT2OID.oid(), db.into_datum()),
+            (PgBuiltInOids::TEXTOID.oid(), key.into_datum()),
+        ]),
     )?;
 
     let mut entries: Vec<(String, f64)> = Vec::with_capacity(table.len());

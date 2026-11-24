@@ -2,6 +2,20 @@
 
 All notable changes to `pg_redis_core` are documented in this file.
 
+## [0.6.0] - 2026-11-24
+
+### Added
+- **Multiple Logical Redis Databases (`SELECT 0..N-1`, `pg_redis.databases`):**
+  - Added `pg_redis.databases` GUC (default `16`, range `1`–`1024`, `SIGHUP`) matching standard Redis behavior so clients like `ioredis`, `BullMQ`, `redis-py`, `go-redis/v9`, and `Jedis` can connect to numbered databases (`redis://host:6379/1`, `SELECT 2`, etc.).
+  - Added `db SMALLINT NOT NULL DEFAULT 0` column and composite `(db, ...)` primary keys/indexes across all 7 catalog tables (`pg_redis_strings`, `pg_redis_key_expiry`, `pg_redis_hashes`, `pg_redis_lists`, `pg_redis_zsets`, `pg_redis_sets`, `pg_redis_streams`) while keeping SQL inspection clean (`WHERE db = 0`) and preserving all existing DB `0` rows.
+  - Scoped L1 hot-key cache (`L1Cache`), blocking `KeyNotifier` wakeups (`BZPOPMIN`, `BLPOP`, `XREAD BLOCK`), Lua 5.1 `EVAL`/`EVALSHA`, universal TTL eviction, `DBSIZE`, `KEYS`, `SCAN`, and all 6 data types per `(db, key)`. Pub/Sub remains global across databases (matching real Redis).
+  - Updated `FLUSHDB [ASYNC|SYNC]` to clear only the currently selected database while `FLUSHALL [ASYNC|SYNC]` clears all databases.
+  - Added `MOVE key db` (atomically moving keys + TTL without overwriting destination keys) and `SWAPDB index1 index2` (atomically swapping two databases).
+  - Exposed `databases` in `INFO # Server` and dynamic `CONFIG GET databases`.
+- **Upgrade Script & Tests:**
+  - Added `sql/pg_redis_core--0.5.0--0.6.0.sql` (plus startup `ensure_schema()` safety-net migration) to cleanly migrate pre-0.6.0 tables with zero data loss.
+  - Added `tests/clients/pubsub/test_multidb.mjs` (wired into `tests/run_all_tests.sh`) and `pg_test_multi_database_isolation_and_ops` in `src/lib.rs`.
+
 ## [0.5.0] - 2026-11-24
 
 ### Added

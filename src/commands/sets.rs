@@ -13,20 +13,21 @@ fn parse_i64(b: &Bytes) -> Option<i64> {
     std::str::from_utf8(b).ok()?.parse::<i64>().ok()
 }
 
-pub fn cmd_sadd(client: &mut SpiClient, args: &[Bytes]) -> SpiResult<RespValue> {
+pub fn cmd_sadd(client: &mut SpiClient, db: i16, args: &[Bytes]) -> SpiResult<RespValue> {
     if args.len() < 3 {
         return Ok(RespValue::wrong_arity("sadd"));
     }
     let key = as_str(&args[1]);
-    keys::purge_if_expired_non_string(client, &key)?;
+    keys::purge_if_expired_non_string(client, db, &key)?;
     let mut added: i64 = 0;
 
     for raw_member in &args[2..] {
         let member = as_str(raw_member);
         let res = client.update(
-            "INSERT INTO pg_redis_sets (key, member) VALUES ($1, $2) ON CONFLICT (key, member) DO NOTHING",
+            "INSERT INTO pg_redis_sets (db, key, member) VALUES ($1, $2, $3) ON CONFLICT (db, key, member) DO NOTHING",
             None,
             Some(vec![
+                (PgBuiltInOids::INT2OID.oid(), db.into_datum()),
                 (PgBuiltInOids::TEXTOID.oid(), key.clone().into_datum()),
                 (PgBuiltInOids::TEXTOID.oid(), member.into_datum()),
             ]),
@@ -37,12 +38,12 @@ pub fn cmd_sadd(client: &mut SpiClient, args: &[Bytes]) -> SpiResult<RespValue> 
     Ok(RespValue::Integer(added))
 }
 
-pub fn cmd_srem(client: &mut SpiClient, args: &[Bytes]) -> SpiResult<RespValue> {
+pub fn cmd_srem(client: &mut SpiClient, db: i16, args: &[Bytes]) -> SpiResult<RespValue> {
     if args.len() < 3 {
         return Ok(RespValue::wrong_arity("srem"));
     }
     let key = as_str(&args[1]);
-    if keys::purge_if_expired_non_string(client, &key)? {
+    if keys::purge_if_expired_non_string(client, db, &key)? {
         return Ok(RespValue::Integer(0));
     }
     let mut removed: i64 = 0;
@@ -50,9 +51,10 @@ pub fn cmd_srem(client: &mut SpiClient, args: &[Bytes]) -> SpiResult<RespValue> 
     for raw_member in &args[2..] {
         let member = as_str(raw_member);
         let res = client.update(
-            "DELETE FROM pg_redis_sets WHERE key = $1 AND member = $2",
+            "DELETE FROM pg_redis_sets WHERE db = $1 AND key = $2 AND member = $3",
             None,
             Some(vec![
+                (PgBuiltInOids::INT2OID.oid(), db.into_datum()),
                 (PgBuiltInOids::TEXTOID.oid(), key.clone().into_datum()),
                 (PgBuiltInOids::TEXTOID.oid(), member.into_datum()),
             ]),
@@ -61,24 +63,27 @@ pub fn cmd_srem(client: &mut SpiClient, args: &[Bytes]) -> SpiResult<RespValue> 
     }
 
     if removed > 0 {
-        keys::cleanup_expiry_if_empty(client, "pg_redis_sets", &key)?;
+        keys::cleanup_expiry_if_empty(client, "pg_redis_sets", db, &key)?;
     }
 
     Ok(RespValue::Integer(removed))
 }
 
-pub fn cmd_smembers(client: &SpiClient, args: &[Bytes]) -> SpiResult<RespValue> {
+pub fn cmd_smembers(client: &SpiClient, db: i16, args: &[Bytes]) -> SpiResult<RespValue> {
     if args.len() != 2 {
         return Ok(RespValue::wrong_arity("smembers"));
     }
     let key = as_str(&args[1]);
-    if keys::is_non_string_expired(client, &key)? {
+    if keys::is_non_string_expired(client, db, &key)? {
         return Ok(RespValue::Array(Vec::new()));
     }
     let table = client.select(
-        "SELECT member FROM pg_redis_sets WHERE key = $1 ORDER BY member ASC",
+        "SELECT member FROM pg_redis_sets WHERE db = $1 AND key = $2 ORDER BY member ASC",
         None,
-        Some(vec![(PgBuiltInOids::TEXTOID.oid(), key.into_datum())]),
+        Some(vec![
+            (PgBuiltInOids::INT2OID.oid(), db.into_datum()),
+            (PgBuiltInOids::TEXTOID.oid(), key.into_datum()),
+        ]),
     )?;
 
     let mut out = Vec::with_capacity(table.len());
@@ -90,20 +95,21 @@ pub fn cmd_smembers(client: &SpiClient, args: &[Bytes]) -> SpiResult<RespValue> 
     Ok(RespValue::Array(out))
 }
 
-pub fn cmd_sismember(client: &SpiClient, args: &[Bytes]) -> SpiResult<RespValue> {
+pub fn cmd_sismember(client: &SpiClient, db: i16, args: &[Bytes]) -> SpiResult<RespValue> {
     if args.len() != 3 {
         return Ok(RespValue::wrong_arity("sismember"));
     }
     let key = as_str(&args[1]);
     let member = as_str(&args[2]);
-    if keys::is_non_string_expired(client, &key)? {
+    if keys::is_non_string_expired(client, db, &key)? {
         return Ok(RespValue::Integer(0));
     }
     let exists = client
         .select(
-            "SELECT EXISTS(SELECT 1 FROM pg_redis_sets WHERE key = $1 AND member = $2)",
+            "SELECT EXISTS(SELECT 1 FROM pg_redis_sets WHERE db = $1 AND key = $2 AND member = $3)",
             None,
             Some(vec![
+                (PgBuiltInOids::INT2OID.oid(), db.into_datum()),
                 (PgBuiltInOids::TEXTOID.oid(), key.into_datum()),
                 (PgBuiltInOids::TEXTOID.oid(), member.into_datum()),
             ]),
@@ -115,19 +121,22 @@ pub fn cmd_sismember(client: &SpiClient, args: &[Bytes]) -> SpiResult<RespValue>
     Ok(RespValue::Integer(if exists { 1 } else { 0 }))
 }
 
-pub fn cmd_scard(client: &SpiClient, args: &[Bytes]) -> SpiResult<RespValue> {
+pub fn cmd_scard(client: &SpiClient, db: i16, args: &[Bytes]) -> SpiResult<RespValue> {
     if args.len() != 2 {
         return Ok(RespValue::wrong_arity("scard"));
     }
     let key = as_str(&args[1]);
-    if keys::is_non_string_expired(client, &key)? {
+    if keys::is_non_string_expired(client, db, &key)? {
         return Ok(RespValue::Integer(0));
     }
     let count = client
         .select(
-            "SELECT COUNT(*)::BIGINT FROM pg_redis_sets WHERE key = $1",
+            "SELECT COUNT(*)::BIGINT FROM pg_redis_sets WHERE db = $1 AND key = $2",
             None,
-            Some(vec![(PgBuiltInOids::TEXTOID.oid(), key.into_datum())]),
+            Some(vec![
+                (PgBuiltInOids::INT2OID.oid(), db.into_datum()),
+                (PgBuiltInOids::TEXTOID.oid(), key.into_datum()),
+            ]),
         )?
         .first()
         .get_one::<i64>()?
@@ -136,7 +145,7 @@ pub fn cmd_scard(client: &SpiClient, args: &[Bytes]) -> SpiResult<RespValue> {
     Ok(RespValue::Integer(count))
 }
 
-pub fn cmd_spop(client: &mut SpiClient, args: &[Bytes]) -> SpiResult<RespValue> {
+pub fn cmd_spop(client: &mut SpiClient, db: i16, args: &[Bytes]) -> SpiResult<RespValue> {
     if args.len() < 2 || args.len() > 3 {
         return Ok(RespValue::wrong_arity("spop"));
     }
@@ -153,7 +162,7 @@ pub fn cmd_spop(client: &mut SpiClient, args: &[Bytes]) -> SpiResult<RespValue> 
         None
     };
 
-    if keys::purge_if_expired_non_string(client, &key)? {
+    if keys::purge_if_expired_non_string(client, db, &key)? {
         return Ok(match count_arg {
             None => RespValue::Null,
             Some(_) => RespValue::Array(Vec::new()),
@@ -167,14 +176,15 @@ pub fn cmd_spop(client: &mut SpiClient, args: &[Bytes]) -> SpiResult<RespValue> 
 
     let table = client.update(
         "WITH popped AS ( \
-            SELECT key, member FROM pg_redis_sets \
-            WHERE key = $1 ORDER BY member ASC LIMIT $2 \
+            SELECT db, key, member FROM pg_redis_sets \
+            WHERE db = $1 AND key = $2 ORDER BY member ASC LIMIT $3 \
         ) \
         DELETE FROM pg_redis_sets s USING popped p \
-        WHERE s.key = p.key AND s.member = p.member \
+        WHERE s.db = p.db AND s.key = p.key AND s.member = p.member \
         RETURNING s.member",
         None,
         Some(vec![
+            (PgBuiltInOids::INT2OID.oid(), db.into_datum()),
             (PgBuiltInOids::TEXTOID.oid(), key.clone().into_datum()),
             (PgBuiltInOids::INT8OID.oid(), limit.into_datum()),
         ]),
@@ -194,7 +204,7 @@ pub fn cmd_spop(client: &mut SpiClient, args: &[Bytes]) -> SpiResult<RespValue> 
         });
     }
 
-    keys::cleanup_expiry_if_empty(client, "pg_redis_sets", &key)?;
+    keys::cleanup_expiry_if_empty(client, "pg_redis_sets", db, &key)?;
 
     match count_arg {
         None => Ok(RespValue::bulk(members.into_iter().next().unwrap())),
@@ -205,7 +215,7 @@ pub fn cmd_spop(client: &mut SpiClient, args: &[Bytes]) -> SpiResult<RespValue> 
 }
 
 /// `SSCAN key cursor [MATCH pattern] [COUNT count]`
-pub fn cmd_sscan(client: &SpiClient, args: &[Bytes]) -> SpiResult<RespValue> {
+pub fn cmd_sscan(client: &SpiClient, db: i16, args: &[Bytes]) -> SpiResult<RespValue> {
     if args.len() < 3 {
         return Ok(RespValue::wrong_arity("sscan"));
     }
@@ -248,7 +258,7 @@ pub fn cmd_sscan(client: &SpiClient, args: &[Bytes]) -> SpiResult<RespValue> {
         }
     }
 
-    if keys::is_non_string_expired(client, &key)? {
+    if keys::is_non_string_expired(client, db, &key)? {
         return Ok(RespValue::Array(vec![
             RespValue::bulk("0"),
             RespValue::Array(Vec::new()),
@@ -256,9 +266,12 @@ pub fn cmd_sscan(client: &SpiClient, args: &[Bytes]) -> SpiResult<RespValue> {
     }
 
     let table = client.select(
-        "SELECT member FROM pg_redis_sets WHERE key = $1 ORDER BY member ASC",
+        "SELECT member FROM pg_redis_sets WHERE db = $1 AND key = $2 ORDER BY member ASC",
         None,
-        Some(vec![(PgBuiltInOids::TEXTOID.oid(), key.into_datum())]),
+        Some(vec![
+            (PgBuiltInOids::INT2OID.oid(), db.into_datum()),
+            (PgBuiltInOids::TEXTOID.oid(), key.into_datum()),
+        ]),
     )?;
 
     let mut members: Vec<String> = Vec::with_capacity(table.len());

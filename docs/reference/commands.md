@@ -1,6 +1,6 @@
 # Supported Redis Commands
 
-`pg_redis_core` supports **115 Redis commands** over both **RESP2** and **RESP3** (plus inline commands), covering Strings (`GETEX`), Universal Keys/Expiry across all 6 data types (`EXPIRE`/`PEXPIRE` with `NX|XX|GT|LT`, `EXPIRETIME`/`PEXPIRETIME`), Hashes (`HSCAN`), Lists, Sorted Sets (`ZSCAN`), Sets (`SSCAN`), Streams, **Pub/Sub** (`PUBLISH`/`SUBSCRIBE`/`UNSUBSCRIBE`/`PSUBSCRIBE`/`PUNSUBSCRIBE`/`PUBSUB`), Blocking Operations (`BZPOPMIN`, `BLPOP`, `XREAD BLOCK`), Sandboxed Lua 5.1 Scripting (`EVAL`/`EVALSHA`/`SCRIPT`), Transactions, `AUTH` (`requirepass`), and Multi-Client `CLIENT LIST`/`KILL` — verified on **PostgreSQL 15 & 16** for **BullMQ 5.13.0** and **Medusa 2.22.7 (`ioredis 5.11.1`)**.
+`pg_redis_core` supports **117 Redis commands** over both **RESP2** and **RESP3** (plus inline commands), covering multiple logical databases (`SELECT 0..N-1`, `MOVE`, `SWAPDB`, `FLUSHDB` vs `FLUSHALL`), Strings (`GETEX`), Universal Keys/Expiry across all 6 data types (`EXPIRE`/`PEXPIRE` with `NX|XX|GT|LT`, `EXPIRETIME`/`PEXPIRETIME`), Hashes (`HSCAN`), Lists, Sorted Sets (`ZSCAN`), Sets (`SSCAN`), Streams, **Pub/Sub** (`PUBLISH`/`SUBSCRIBE`/`UNSUBSCRIBE`/`PSUBSCRIBE`/`PUNSUBSCRIBE`/`PUBSUB`), Blocking Operations (`BZPOPMIN`, `BLPOP`, `XREAD BLOCK`), Sandboxed Lua 5.1 Scripting (`EVAL`/`EVALSHA`/`SCRIPT`), Transactions, Optional TLS/mTLS (`rediss://`), `AUTH` (`requirepass`), and Multi-Client `CLIENT LIST`/`KILL` — verified on **PostgreSQL 15 & 16** for **BullMQ 5.13.0** and **Medusa 2.22.7 (`ioredis 5.11.1`)**.
 
 ## Strings
 
@@ -33,11 +33,14 @@
 | `TTL` / `PTTL` | `TTL key` / `PTTL key` | Returns remaining TTL for any key type, `-1` (no expiry), or `-2` (missing) |
 | `PERSIST` | `PERSIST key` | Removes expiration from any key type |
 | `TYPE` | `TYPE key` | Returns `string`, `hash`, `list`, `zset`, `set`, `stream`, or `none` |
-| `RENAME` | `RENAME key newkey` | Atomically renames key (and its TTL) across all 6 catalog tables |
-| `KEYS` | `KEYS pattern` | Supports Redis glob patterns (`*`, `?`, `[abc]`, `[^a]`, `[a-z]`, `\x`) |
-| `SCAN` | `SCAN cursor [MATCH pattern] [COUNT count] [TYPE type]` | Cursor-based key iteration with glob and type filtering |
-| `DBSIZE` | `DBSIZE` | Total count of active keys across all catalog tables |
-| `FLUSHDB` / `FLUSHALL` | `FLUSHDB` | Clears all catalog tables, expiry metadata, and L1 cache |
+| `RENAME` | `RENAME key newkey` | Atomically renames key (and its TTL) within the selected DB |
+| `MOVE` | `MOVE key db` | Atomically moves key (and its TTL) to target DB if absent there (`1` moved, `0` skipped) |
+| `SWAPDB` | `SWAPDB index1 index2` | Atomically swaps all keys and expiries between two logical DBs |
+| `KEYS` | `KEYS pattern` | Supports Redis glob patterns (`*`, `?`, `[abc]`, `[^a]`, `[a-z]`, `\x`) in the selected DB |
+| `SCAN` | `SCAN cursor [MATCH pattern] [COUNT count] [TYPE type]` | Cursor-based key iteration with glob and type filtering in the selected DB |
+| `DBSIZE` | `DBSIZE` | Total count of active keys in the selected DB |
+| `FLUSHDB` | `FLUSHDB [ASYNC\|SYNC]` | Clears all keys in the currently selected DB only |
+| `FLUSHALL` | `FLUSHALL [ASYNC\|SYNC]` | Clears all keys across all logical DBs and L1 cache |
 
 ## Hashes
 
@@ -151,7 +154,8 @@
 | `PING` / `ECHO` | `PING [msg]` / `ECHO msg` | Resolved in memory without SPI overhead (returns `["pong", msg]` in RESP2 subscribed mode) |
 | `RESET` | `RESET` | Unsubscribes all channels/patterns, clears `MULTI` state, resets auth & protocol to RESP2, returns `+RESET` |
 | `CLIENT` | `CLIENT SETINFO \| SETNAME \| GETNAME \| ID \| LIST \| INFO \| KILL \| MAINT_NOTIFICATIONS \| NO-EVICT \| NO-TOUCH` | Full multi-connection registry (`LIST [TYPE ...] [ID ...]`, `KILL [ID\|ADDR\|ip:port]`) for BullMQ `getWorkers()`, `go-redis/v9`, `redis-py`, `ioredis`, and `Jedis` |
-| `INFO` | `INFO [section]` | Reports `pg_redis_core` version, `tcp_port`, `tls_port`, `# Clients` (`connected_clients`, `maxclients`), `# Memory` (`maxmemory_policy:noeviction`), `# Stats` (L1 cache hit/miss counters), and `# Replication` |
-| `COMMAND` | `COMMAND [COUNT \| DOCS \| LIST]` | `redis-cli` interactive startup compatibility (returns all 115 supported commands) |
+| `INFO` | `INFO [section]` | Reports `pg_redis_core` version, `tcp_port`, `tls_port`, `databases`, `# Clients` (`connected_clients`, `maxclients`), `# Memory` (`maxmemory_policy:noeviction`), `# Stats` (L1 cache hit/miss counters), and `# Replication` |
+| `COMMAND` | `COMMAND [COUNT \| DOCS \| LIST]` | `redis-cli` interactive startup compatibility (returns all 117 supported commands) |
 | `CONFIG GET` | `CONFIG GET pattern` | Glob-matched server config keys (`databases`, `save`, `appendonly`, `maxmemory-policy`, `maxclients`, `lua-time-limit`, `port`, `tls-port`, `tls-auth-clients`) |
-| `SELECT` / `TIME` / `QUIT` | Standard Redis syntax | Session lifecycle commands |
+| `SELECT` | `SELECT index` | Switches active logical Redis database (`0`..`pg_redis.databases - 1`, default 16) |
+| `TIME` / `QUIT` | Standard Redis syntax | Session lifecycle commands |

@@ -689,6 +689,7 @@ async fn handle_connection(
                     Ok(bcmd) => {
                         execute_blocking_command(
                             bcmd,
+                            conn.selected_db as i16,
                             stream.tcp_ref(),
                             &notifier,
                             &mut shutdown_rx,
@@ -755,6 +756,7 @@ async fn handle_connection(
 
 async fn execute_blocking_command(
     cmd: BlockingCommand,
+    db: i16,
     stream: &TcpStream,
     notifier: &KeyNotifier,
     shutdown_rx: &mut watch::Receiver<bool>,
@@ -771,11 +773,11 @@ async fn execute_blocking_command(
             } else {
                 Some(tokio::time::Instant::now() + Duration::from_secs_f64(timeout_secs))
             };
-            wait_for_keys(&keys, deadline, stream, notifier, shutdown_rx, kill_rx, || {
+            wait_for_keys(db, &keys, deadline, stream, notifier, shutdown_rx, kill_rx, || {
                 let keys_guard = AssertUnwindSafe(&keys);
                 BackgroundWorker::transaction(move || {
                     Spi::connect(|mut client| {
-                        zsets::try_bzpop_once(&mut client, *keys_guard, is_max).unwrap_or(None)
+                        zsets::try_bzpop_once(&mut client, db, *keys_guard, is_max).unwrap_or(None)
                     })
                 })
             })
@@ -791,11 +793,11 @@ async fn execute_blocking_command(
             } else {
                 Some(tokio::time::Instant::now() + Duration::from_secs_f64(timeout_secs))
             };
-            wait_for_keys(&keys, deadline, stream, notifier, shutdown_rx, kill_rx, || {
+            wait_for_keys(db, &keys, deadline, stream, notifier, shutdown_rx, kill_rx, || {
                 let keys_guard = AssertUnwindSafe(&keys);
                 BackgroundWorker::transaction(move || {
                     Spi::connect(|mut client| {
-                        lists::try_blpop_once(&mut client, *keys_guard, is_right).unwrap_or(None)
+                        lists::try_blpop_once(&mut client, db, *keys_guard, is_right).unwrap_or(None)
                     })
                 })
             })
@@ -807,7 +809,7 @@ async fn execute_blocking_command(
                 let req_guard = AssertUnwindSafe(&req.streams);
                 BackgroundWorker::transaction(move || {
                     Spi::connect(|client| {
-                        streams::resolve_xread_ids(&client, *req_guard)
+                        streams::resolve_xread_ids(&client, db, *req_guard)
                             .unwrap_or_else(|e| Err(RespValue::err(format!("ERR SPI error: {e}"))))
                     })
                 })
@@ -828,11 +830,12 @@ async fn execute_blocking_command(
             let keys: Vec<String> = resolved.iter().map(|(k, _, _)| k.clone()).collect();
             let count = req.count;
 
-            wait_for_keys(&keys, deadline, stream, notifier, shutdown_rx, kill_rx, || {
+            wait_for_keys(db, &keys, deadline, stream, notifier, shutdown_rx, kill_rx, || {
                 let res_guard = AssertUnwindSafe(&resolved);
                 BackgroundWorker::transaction(move || {
                     Spi::connect(|client| {
-                        streams::execute_xread_resolved(&client, *res_guard, count).unwrap_or(None)
+                        streams::execute_xread_resolved(&client, db, *res_guard, count)
+                            .unwrap_or(None)
                     })
                 })
             })
@@ -842,6 +845,7 @@ async fn execute_blocking_command(
 }
 
 async fn wait_for_keys<F>(
+    db: i16,
     keys: &[String],
     deadline: Option<tokio::time::Instant>,
     stream: &TcpStream,
@@ -858,7 +862,7 @@ where
         return val;
     }
 
-    let handles = notifier.get_notifiers(keys);
+    let handles = notifier.get_notifiers(db, keys);
     let mut can_peek = true;
 
     let result = loop {
@@ -928,7 +932,7 @@ where
     };
 
     drop(handles);
-    notifier.gc_keys(keys);
+    notifier.gc_keys(db, keys);
     result
 }
 

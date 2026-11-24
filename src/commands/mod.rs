@@ -451,7 +451,8 @@ fn try_execute_in_memory_multi(
         "GET" if args.len() == 2 => {
             let c = cache?;
             let key = String::from_utf8_lossy(&args[1]);
-            c.get(&key).map(|v| vec![RespValue::BulkString(v)])
+            c.get(conn.selected_db as i16, &key)
+                .map(|v| vec![RespValue::BulkString(v)])
         }
         _ => None,
     }
@@ -505,7 +506,7 @@ fn handle_eval_cmd(
     pubsub: Option<&PubSubHub>,
     conn: &mut ConnectionState,
     args: &[Bytes],
-    mutated_keys: &mut Vec<String>,
+    mutated_keys: &mut Vec<(i16, String)>,
 ) -> RespValue {
     let name = if is_sha { "evalsha" } else { "eval" };
     if args.len() < 3 {
@@ -566,7 +567,7 @@ pub fn dispatch_with_spi(
     clients: Option<&ClientRegistry>,
     conn: &mut ConnectionState,
     args: &[Bytes],
-    mutated_keys: &mut Vec<String>,
+    mutated_keys: &mut Vec<(i16, String)>,
 ) -> SpiResult<RespValue> {
     if args.is_empty() {
         return Ok(RespValue::err("ERR empty command"));
@@ -640,7 +641,7 @@ pub fn dispatch_from_lua(
     pubsub: Option<&PubSubHub>,
     conn: &mut ConnectionState,
     args: &[Bytes],
-    mutated_keys: &mut Vec<String>,
+    mutated_keys: &mut Vec<(i16, String)>,
 ) -> SpiResult<RespValue> {
     dispatch_single_non_multi(
         client,
@@ -664,9 +665,10 @@ fn dispatch_single_non_multi(
     clients: Option<&ClientRegistry>,
     conn: &mut ConnectionState,
     args: &[Bytes],
-    mutated_keys: &mut Vec<String>,
+    mutated_keys: &mut Vec<(i16, String)>,
 ) -> SpiResult<RespValue> {
     let cmd = cmd_name_upper(args);
+    let db = conn.selected_db as i16;
 
     match cmd.as_str() {
         // Server / Protocol
@@ -718,110 +720,113 @@ fn dispatch_single_non_multi(
         )),
 
         // Strings
-        "GET" => strings::cmd_get(client, plans, cache, args),
-        "GETEX" => strings::cmd_getex(client, plans, cache, args),
-        "SET" => strings::cmd_set(client, plans, cache, args),
-        "SETEX" => strings::cmd_setex(client, plans, cache, args, false),
-        "PSETEX" => strings::cmd_setex(client, plans, cache, args, true),
-        "SETNX" => strings::cmd_setnx(client, plans, cache, args),
-        "GETSET" => strings::cmd_getset(client, plans, cache, args),
-        "GETDEL" => strings::cmd_getdel(client, plans, cache, args),
-        "MGET" => strings::cmd_mget(client, plans, cache, args),
-        "MSET" => strings::cmd_mset(client, plans, cache, args),
-        "INCR" => strings::cmd_incrby(client, plans, cache, args, Some(1), false),
-        "DECR" => strings::cmd_incrby(client, plans, cache, args, Some(-1), false),
-        "INCRBY" => strings::cmd_incrby(client, plans, cache, args, None, false),
-        "DECRBY" => strings::cmd_incrby(client, plans, cache, args, None, true),
-        "INCRBYFLOAT" => strings::cmd_incrbyfloat(client, plans, cache, args),
-        "APPEND" => strings::cmd_append(client, plans, cache, args),
-        "STRLEN" => strings::cmd_strlen(client, plans, cache, args),
+        "GET" => strings::cmd_get(client, plans, cache, db, args),
+        "GETEX" => strings::cmd_getex(client, plans, cache, db, args),
+        "SET" => strings::cmd_set(client, plans, cache, db, args),
+        "SETEX" => strings::cmd_setex(client, plans, cache, db, args, false),
+        "PSETEX" => strings::cmd_setex(client, plans, cache, db, args, true),
+        "SETNX" => strings::cmd_setnx(client, plans, cache, db, args),
+        "GETSET" => strings::cmd_getset(client, plans, cache, db, args),
+        "GETDEL" => strings::cmd_getdel(client, plans, cache, db, args),
+        "MGET" => strings::cmd_mget(client, plans, cache, db, args),
+        "MSET" => strings::cmd_mset(client, plans, cache, db, args),
+        "INCR" => strings::cmd_incrby(client, plans, cache, db, args, Some(1), false),
+        "DECR" => strings::cmd_incrby(client, plans, cache, db, args, Some(-1), false),
+        "INCRBY" => strings::cmd_incrby(client, plans, cache, db, args, None, false),
+        "DECRBY" => strings::cmd_incrby(client, plans, cache, db, args, None, true),
+        "INCRBYFLOAT" => strings::cmd_incrbyfloat(client, plans, cache, db, args),
+        "APPEND" => strings::cmd_append(client, plans, cache, db, args),
+        "STRLEN" => strings::cmd_strlen(client, plans, cache, db, args),
 
         // Keys & Expiry
-        "DEL" | "UNLINK" => keys::cmd_del(client, cache, args),
-        "EXISTS" => keys::cmd_exists(client, args),
-        "EXPIRE" => keys::cmd_expire(client, cache, args, false, false),
-        "PEXPIRE" => keys::cmd_expire(client, cache, args, true, false),
-        "EXPIREAT" => keys::cmd_expire(client, cache, args, false, true),
-        "PEXPIREAT" => keys::cmd_expire(client, cache, args, true, true),
-        "EXPIRETIME" => keys::cmd_expiretime(client, args, false),
-        "PEXPIRETIME" => keys::cmd_expiretime(client, args, true),
-        "TTL" => keys::cmd_ttl(client, args, false),
-        "PTTL" => keys::cmd_ttl(client, args, true),
-        "PERSIST" => keys::cmd_persist(client, cache, args),
-        "TYPE" => keys::cmd_type(client, args),
-        "RENAME" => keys::cmd_rename(client, cache, args, mutated_keys),
-        "KEYS" => keys::cmd_keys(client, args),
-        "SCAN" => keys::cmd_scan(client, args),
-        "DBSIZE" => keys::cmd_dbsize(client),
-        "FLUSHDB" | "FLUSHALL" => keys::cmd_flushdb(client, cache),
+        "DEL" | "UNLINK" => keys::cmd_del(client, cache, db, args),
+        "EXISTS" => keys::cmd_exists(client, db, args),
+        "EXPIRE" => keys::cmd_expire(client, cache, db, args, false, false),
+        "PEXPIRE" => keys::cmd_expire(client, cache, db, args, true, false),
+        "EXPIREAT" => keys::cmd_expire(client, cache, db, args, false, true),
+        "PEXPIREAT" => keys::cmd_expire(client, cache, db, args, true, true),
+        "EXPIRETIME" => keys::cmd_expiretime(client, db, args, false),
+        "PEXPIRETIME" => keys::cmd_expiretime(client, db, args, true),
+        "TTL" => keys::cmd_ttl(client, db, args, false),
+        "PTTL" => keys::cmd_ttl(client, db, args, true),
+        "PERSIST" => keys::cmd_persist(client, cache, db, args),
+        "TYPE" => keys::cmd_type(client, db, args),
+        "RENAME" => keys::cmd_rename(client, cache, db, args, mutated_keys),
+        "MOVE" => keys::cmd_move(client, cache, db, args, mutated_keys),
+        "SWAPDB" => keys::cmd_swapdb(client, cache, args),
+        "KEYS" => keys::cmd_keys(client, db, args),
+        "SCAN" => keys::cmd_scan(client, db, args),
+        "DBSIZE" => keys::cmd_dbsize(client, db),
+        "FLUSHDB" => keys::cmd_flushdb(client, cache, db, args),
+        "FLUSHALL" => keys::cmd_flushall(client, cache, args),
 
         // Hashes
-        "HSET" => hashes::cmd_hset(client, plans, args, false),
-        "HMSET" => hashes::cmd_hset(client, plans, args, true),
-        "HSETNX" => hashes::cmd_hsetnx(client, args),
-        "HGET" => hashes::cmd_hget(client, plans, args),
-        "HMGET" => hashes::cmd_hmget(client, plans, args),
-        "HGETALL" => hashes::cmd_hgetall(client, plans, args),
-        "HDEL" => hashes::cmd_hdel(client, args),
-        "HEXISTS" => hashes::cmd_hexists(client, args),
-        "HLEN" => hashes::cmd_hlen(client, args),
-        "HKEYS" => hashes::cmd_hkeys(client, args),
-        "HVALS" => hashes::cmd_hvals(client, args),
-        "HINCRBY" => hashes::cmd_hincrby(client, plans, args),
-        "HINCRBYFLOAT" => hashes::cmd_hincrbyfloat(client, plans, args),
-        "HSCAN" => hashes::cmd_hscan(client, args),
+        "HSET" => hashes::cmd_hset(client, plans, db, args, false),
+        "HMSET" => hashes::cmd_hset(client, plans, db, args, true),
+        "HSETNX" => hashes::cmd_hsetnx(client, db, args),
+        "HGET" => hashes::cmd_hget(client, plans, db, args),
+        "HMGET" => hashes::cmd_hmget(client, plans, db, args),
+        "HGETALL" => hashes::cmd_hgetall(client, plans, db, args),
+        "HDEL" => hashes::cmd_hdel(client, db, args),
+        "HEXISTS" => hashes::cmd_hexists(client, db, args),
+        "HLEN" => hashes::cmd_hlen(client, db, args),
+        "HKEYS" => hashes::cmd_hkeys(client, db, args),
+        "HVALS" => hashes::cmd_hvals(client, db, args),
+        "HINCRBY" => hashes::cmd_hincrby(client, plans, db, args),
+        "HINCRBYFLOAT" => hashes::cmd_hincrbyfloat(client, plans, db, args),
+        "HSCAN" => hashes::cmd_hscan(client, db, args),
 
         // Lists
-        "LPUSH" => lists::cmd_push(client, args, true, mutated_keys),
-        "RPUSH" => lists::cmd_push(client, args, false, mutated_keys),
-        "LPOP" => lists::cmd_pop(client, args, true),
-        "RPOP" => lists::cmd_pop(client, args, false),
-        "LRANGE" => lists::cmd_lrange(client, args),
-        "LLEN" => lists::cmd_llen(client, args),
-        "LINDEX" => lists::cmd_lindex(client, args),
-        "LSET" => lists::cmd_lset(client, args),
-        "LREM" => lists::cmd_lrem(client, args),
-        "LTRIM" => lists::cmd_ltrim(client, args),
-        "LPOS" => lists::cmd_lpos(client, args),
-        "RPOPLPUSH" => lists::cmd_rpoplpush(client, args, mutated_keys),
-        "LMOVE" => lists::cmd_lmove_cmd(client, args, mutated_keys),
+        "LPUSH" => lists::cmd_push(client, db, args, true, mutated_keys),
+        "RPUSH" => lists::cmd_push(client, db, args, false, mutated_keys),
+        "LPOP" => lists::cmd_pop(client, db, args, true),
+        "RPOP" => lists::cmd_pop(client, db, args, false),
+        "LRANGE" => lists::cmd_lrange(client, db, args),
+        "LLEN" => lists::cmd_llen(client, db, args),
+        "LINDEX" => lists::cmd_lindex(client, db, args),
+        "LSET" => lists::cmd_lset(client, db, args),
+        "LREM" => lists::cmd_lrem(client, db, args),
+        "LTRIM" => lists::cmd_ltrim(client, db, args),
+        "LPOS" => lists::cmd_lpos(client, db, args),
+        "RPOPLPUSH" => lists::cmd_rpoplpush(client, db, args, mutated_keys),
+        "LMOVE" => lists::cmd_lmove_cmd(client, db, args, mutated_keys),
 
         // Sorted Sets
-        "ZADD" => zsets::cmd_zadd(client, plans, args, mutated_keys),
-        "ZRANGE" => zsets::cmd_zrange(client, args, false),
-        "ZREVRANGE" => zsets::cmd_zrange(client, args, true),
-        "ZRANGEBYSCORE" => zsets::cmd_zrangebyscore(client, args, false),
-        "ZREVRANGEBYSCORE" => zsets::cmd_zrangebyscore(client, args, true),
-        "ZREM" => zsets::cmd_zrem(client, args),
-        "ZREMRANGEBYRANK" => zsets::cmd_zremrangebyrank(client, args),
-        "ZREMRANGEBYSCORE" => zsets::cmd_zremrangebyscore(client, args),
-        "ZPOPMIN" => zsets::cmd_zpop(client, args, false),
-        "ZPOPMAX" => zsets::cmd_zpop(client, args, true),
-        "ZSCORE" => zsets::cmd_zscore(client, plans, args),
-        "ZCARD" => zsets::cmd_zcard(client, args),
-        "ZRANK" => zsets::cmd_zrank(client, args, false),
-        "ZREVRANK" => zsets::cmd_zrank(client, args, true),
-        "ZINCRBY" => zsets::cmd_zincrby(client, plans, args, mutated_keys),
-        "ZCOUNT" => zsets::cmd_zcount(client, args),
-        "ZSCAN" => zsets::cmd_zscan(client, args),
+        "ZADD" => zsets::cmd_zadd(client, plans, db, args, mutated_keys),
+        "ZRANGE" => zsets::cmd_zrange(client, db, args, false),
+        "ZREVRANGE" => zsets::cmd_zrange(client, db, args, true),
+        "ZRANGEBYSCORE" => zsets::cmd_zrangebyscore(client, db, args, false),
+        "ZREVRANGEBYSCORE" => zsets::cmd_zrangebyscore(client, db, args, true),
+        "ZREM" => zsets::cmd_zrem(client, db, args),
+        "ZREMRANGEBYRANK" => zsets::cmd_zremrangebyrank(client, db, args),
+        "ZREMRANGEBYSCORE" => zsets::cmd_zremrangebyscore(client, db, args),
+        "ZPOPMIN" => zsets::cmd_zpop(client, db, args, false),
+        "ZPOPMAX" => zsets::cmd_zpop(client, db, args, true),
+        "ZSCORE" => zsets::cmd_zscore(client, plans, db, args),
+        "ZCARD" => zsets::cmd_zcard(client, db, args),
+        "ZRANK" => zsets::cmd_zrank(client, db, args, false),
+        "ZREVRANK" => zsets::cmd_zrank(client, db, args, true),
+        "ZINCRBY" => zsets::cmd_zincrby(client, plans, db, args, mutated_keys),
+        "ZCOUNT" => zsets::cmd_zcount(client, db, args),
+        "ZSCAN" => zsets::cmd_zscan(client, db, args),
 
         // Sets
-        "SADD" => sets::cmd_sadd(client, args),
-        "SREM" => sets::cmd_srem(client, args),
-        "SMEMBERS" => sets::cmd_smembers(client, args),
-        "SISMEMBER" => sets::cmd_sismember(client, args),
-        "SCARD" => sets::cmd_scard(client, args),
-        "SPOP" => sets::cmd_spop(client, args),
-        "SSCAN" => sets::cmd_sscan(client, args),
+        "SADD" => sets::cmd_sadd(client, db, args),
+        "SREM" => sets::cmd_srem(client, db, args),
+        "SMEMBERS" => sets::cmd_smembers(client, db, args),
+        "SISMEMBER" => sets::cmd_sismember(client, db, args),
+        "SCARD" => sets::cmd_scard(client, db, args),
+        "SPOP" => sets::cmd_spop(client, db, args),
+        "SSCAN" => sets::cmd_sscan(client, db, args),
 
         // Streams
-        "XADD" => streams::cmd_xadd(client, args, mutated_keys),
-        "XTRIM" => streams::cmd_xtrim(client, args),
-        "XLEN" => streams::cmd_xlen(client, args),
-        "XDEL" => streams::cmd_xdel(client, args),
-        "XRANGE" => streams::cmd_xrange(client, args, false),
-        "XREVRANGE" => streams::cmd_xrange(client, args, true),
-        "XREAD" => streams::cmd_xread_nonblocking(client, args),
+        "XADD" => streams::cmd_xadd(client, db, args, mutated_keys),
+        "XTRIM" => streams::cmd_xtrim(client, db, args),
+        "XLEN" => streams::cmd_xlen(client, db, args),
+        "XDEL" => streams::cmd_xdel(client, db, args),
+        "XRANGE" => streams::cmd_xrange(client, db, args, false),
+        "XREVRANGE" => streams::cmd_xrange(client, db, args, true),
+        "XREAD" => streams::cmd_xread_nonblocking(client, db, args),
 
         // Non-blocking fallback if called inside MULTI/Lua
         "BZPOPMIN" | "BZPOPMAX" => {
@@ -832,7 +837,8 @@ fn dispatch_single_non_multi(
                 .iter()
                 .map(|b| String::from_utf8_lossy(b).into_owned())
                 .collect();
-            Ok(zsets::try_bzpop_once(client, &keys, cmd == "BZPOPMAX")?.unwrap_or(RespValue::Null))
+            Ok(zsets::try_bzpop_once(client, db, &keys, cmd == "BZPOPMAX")?
+                .unwrap_or(RespValue::Null))
         }
         "BLPOP" | "BRPOP" => {
             if args.len() < 3 {
@@ -842,7 +848,7 @@ fn dispatch_single_non_multi(
                 .iter()
                 .map(|b| String::from_utf8_lossy(b).into_owned())
                 .collect();
-            Ok(lists::try_blpop_once(client, &keys, cmd == "BRPOP")?.unwrap_or(RespValue::Null))
+            Ok(lists::try_blpop_once(client, db, &keys, cmd == "BRPOP")?.unwrap_or(RespValue::Null))
         }
 
         _ => Ok(RespValue::err(format!(
@@ -922,7 +928,7 @@ pub fn execute_batch_in_worker(
         let clients_guard = AssertUnwindSafe(clients);
         let chunk_guard = AssertUnwindSafe(chunk);
 
-        let (tx_results, mutated_keys): (Vec<(RespValue, RespVersion)>, Vec<String>) =
+        let (tx_results, mutated_keys): (Vec<(RespValue, RespVersion)>, Vec<(i16, String)>) =
             BackgroundWorker::transaction(move || {
                 Spi::connect(|mut client| {
                     let mut out = Vec::with_capacity(chunk_guard.len());

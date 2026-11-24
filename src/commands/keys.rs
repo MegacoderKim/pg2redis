@@ -5,6 +5,7 @@ use std::collections::BTreeSet;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::cache::L1Cache;
+use crate::config;
 use crate::protocol::RespValue;
 
 fn as_str(b: &Bytes) -> String {
@@ -30,45 +31,64 @@ const NON_STRING_TABLES: [&str; 5] = [
     "pg_redis_streams",
 ];
 
-/// Fast read-only check: returns `true` if `key` has an expired TTL in `pg_redis_key_expiry`.
-pub fn is_non_string_expired(client: &SpiClient, key: &str) -> SpiResult<bool> {
+const ALL_TABLES_CANONICAL: [&str; 7] = [
+    "pg_redis_strings",
+    "pg_redis_key_expiry",
+    "pg_redis_hashes",
+    "pg_redis_lists",
+    "pg_redis_zsets",
+    "pg_redis_sets",
+    "pg_redis_streams",
+];
+
+/// Fast read-only check: returns `true` if `(db, key)` has an expired TTL in `pg_redis_key_expiry`.
+pub fn is_non_string_expired(client: &SpiClient, db: i16, key: &str) -> SpiResult<bool> {
     let table = client.select(
-        "SELECT 1 FROM pg_redis_key_expiry WHERE key = $1 AND expires_at <= NOW()",
+        "SELECT 1 FROM pg_redis_key_expiry WHERE db = $1 AND key = $2 AND expires_at <= NOW()",
         None,
-        Some(vec![(PgBuiltInOids::TEXTOID.oid(), key.into_datum())]),
+        Some(vec![
+            (PgBuiltInOids::INT2OID.oid(), db.into_datum()),
+            (PgBuiltInOids::TEXTOID.oid(), key.into_datum()),
+        ]),
     )?;
     Ok(!table.is_empty())
 }
 
-/// Lazily deletes all non-string rows and the expiry metadata if `key` has expired.
+/// Lazily deletes all non-string rows and the expiry metadata if `(db, key)` has expired.
 /// Returns `true` if an expired entry was purged.
-pub fn purge_if_expired_non_string(client: &mut SpiClient, key: &str) -> SpiResult<bool> {
-    if !is_non_string_expired(client, key)? {
+pub fn purge_if_expired_non_string(client: &mut SpiClient, db: i16, key: &str) -> SpiResult<bool> {
+    if !is_non_string_expired(client, db, key)? {
         return Ok(false);
     }
-    delete_non_string_key(client, key)?;
+    delete_non_string_key(client, db, key)?;
     Ok(true)
 }
 
-/// Remove a key across all five non-string tables plus `pg_redis_key_expiry`.
+/// Remove `(db, key)` across all five non-string tables plus `pg_redis_key_expiry`.
 /// Returns `true` if at least one data row existed before deletion.
-fn delete_non_string_key(client: &mut SpiClient, key: &str) -> SpiResult<bool> {
+fn delete_non_string_key(client: &mut SpiClient, db: i16, key: &str) -> SpiResult<bool> {
     let mut existed = false;
     for table in NON_STRING_TABLES {
-        let sql = format!("DELETE FROM {table} WHERE key = $1");
+        let sql = format!("DELETE FROM {table} WHERE db = $1 AND key = $2");
         let res = client.update(
             &sql,
             None,
-            Some(vec![(PgBuiltInOids::TEXTOID.oid(), key.into_datum())]),
+            Some(vec![
+                (PgBuiltInOids::INT2OID.oid(), db.into_datum()),
+                (PgBuiltInOids::TEXTOID.oid(), key.into_datum()),
+            ]),
         )?;
         if !res.is_empty() {
             existed = true;
         }
     }
     client.update(
-        "DELETE FROM pg_redis_key_expiry WHERE key = $1",
+        "DELETE FROM pg_redis_key_expiry WHERE db = $1 AND key = $2",
         None,
-        Some(vec![(PgBuiltInOids::TEXTOID.oid(), key.into_datum())]),
+        Some(vec![
+            (PgBuiltInOids::INT2OID.oid(), db.into_datum()),
+            (PgBuiltInOids::TEXTOID.oid(), key.into_datum()),
+        ]),
     )?;
     Ok(existed)
 }
@@ -78,36 +98,43 @@ fn delete_non_string_key(client: &mut SpiClient, key: &str) -> SpiResult<bool> {
 pub fn cleanup_expiry_if_empty(
     client: &mut SpiClient,
     table: &str,
+    db: i16,
     key: &str,
 ) -> SpiResult<()> {
     let sql = format!(
         "DELETE FROM pg_redis_key_expiry \
-         WHERE key = $1 \
-           AND NOT EXISTS (SELECT 1 FROM {table} WHERE key = $1)"
+         WHERE db = $1 AND key = $2 \
+           AND NOT EXISTS (SELECT 1 FROM {table} WHERE db = $1 AND key = $2)"
     );
     client.update(
         &sql,
         None,
-        Some(vec![(PgBuiltInOids::TEXTOID.oid(), key.into_datum())]),
+        Some(vec![
+            (PgBuiltInOids::INT2OID.oid(), db.into_datum()),
+            (PgBuiltInOids::TEXTOID.oid(), key.into_datum()),
+        ]),
     )?;
     Ok(())
 }
 
-fn non_string_key_exists(client: &SpiClient, key: &str) -> SpiResult<bool> {
-    if is_non_string_expired(client, key)? {
+fn non_string_key_exists(client: &SpiClient, db: i16, key: &str) -> SpiResult<bool> {
+    if is_non_string_expired(client, db, key)? {
         return Ok(false);
     }
     let exists = client
         .select(
             "SELECT ( \
-                EXISTS(SELECT 1 FROM pg_redis_hashes WHERE key = $1) \
-                OR EXISTS(SELECT 1 FROM pg_redis_lists WHERE key = $1) \
-                OR EXISTS(SELECT 1 FROM pg_redis_zsets WHERE key = $1) \
-                OR EXISTS(SELECT 1 FROM pg_redis_sets WHERE key = $1) \
-                OR EXISTS(SELECT 1 FROM pg_redis_streams WHERE key = $1) \
+                EXISTS(SELECT 1 FROM pg_redis_hashes WHERE db = $1 AND key = $2) \
+                OR EXISTS(SELECT 1 FROM pg_redis_lists WHERE db = $1 AND key = $2) \
+                OR EXISTS(SELECT 1 FROM pg_redis_zsets WHERE db = $1 AND key = $2) \
+                OR EXISTS(SELECT 1 FROM pg_redis_sets WHERE db = $1 AND key = $2) \
+                OR EXISTS(SELECT 1 FROM pg_redis_streams WHERE db = $1 AND key = $2) \
             )",
             None,
-            Some(vec![(PgBuiltInOids::TEXTOID.oid(), key.into_datum())]),
+            Some(vec![
+                (PgBuiltInOids::INT2OID.oid(), db.into_datum()),
+                (PgBuiltInOids::TEXTOID.oid(), key.into_datum()),
+            ]),
         )?
         .first()
         .get_one::<bool>()?
@@ -115,11 +142,12 @@ fn non_string_key_exists(client: &SpiClient, key: &str) -> SpiResult<bool> {
     Ok(exists)
 }
 
-/// Delete keys across all six catalog tables plus `pg_redis_key_expiry`.
+/// Delete keys in `db` across all six catalog tables plus `pg_redis_key_expiry`.
 /// Returns the number of distinct active (non-expired) keys removed.
 pub fn cmd_del(
     client: &mut SpiClient,
     cache: Option<&L1Cache>,
+    db: i16,
     args: &[Bytes],
 ) -> SpiResult<RespValue> {
     if args.len() < 2 {
@@ -132,29 +160,35 @@ pub fn cmd_del(
         let mut existed = false;
 
         let s_del = client.update(
-            "DELETE FROM pg_redis_strings WHERE key = $1 AND (expires_at IS NULL OR expires_at > NOW())",
+            "DELETE FROM pg_redis_strings WHERE db = $1 AND key = $2 AND (expires_at IS NULL OR expires_at > NOW())",
             None,
-            Some(vec![(PgBuiltInOids::TEXTOID.oid(), key.clone().into_datum())]),
+            Some(vec![
+                (PgBuiltInOids::INT2OID.oid(), db.into_datum()),
+                (PgBuiltInOids::TEXTOID.oid(), key.clone().into_datum()),
+            ]),
         )?;
         if !s_del.is_empty() {
             existed = true;
         } else {
             // Clean up any already-expired tombstone row without counting it
             client.update(
-                "DELETE FROM pg_redis_strings WHERE key = $1",
+                "DELETE FROM pg_redis_strings WHERE db = $1 AND key = $2",
                 None,
-                Some(vec![(PgBuiltInOids::TEXTOID.oid(), key.clone().into_datum())]),
+                Some(vec![
+                    (PgBuiltInOids::INT2OID.oid(), db.into_datum()),
+                    (PgBuiltInOids::TEXTOID.oid(), key.clone().into_datum()),
+                ]),
             )?;
         }
 
         // Purge any already-expired non-string key without counting it as active
-        let was_expired_non_string = purge_if_expired_non_string(client, &key)?;
-        if !was_expired_non_string && delete_non_string_key(client, &key)? {
+        let was_expired_non_string = purge_if_expired_non_string(client, db, &key)?;
+        if !was_expired_non_string && delete_non_string_key(client, db, &key)? {
             existed = true;
         }
 
         if let Some(c) = cache {
-            c.invalidate(&key);
+            c.invalidate(db, &key);
         }
 
         if existed {
@@ -165,7 +199,7 @@ pub fn cmd_del(
     Ok(RespValue::Integer(deleted_keys))
 }
 
-pub fn cmd_exists(client: &SpiClient, args: &[Bytes]) -> SpiResult<RespValue> {
+pub fn cmd_exists(client: &SpiClient, db: i16, args: &[Bytes]) -> SpiResult<RespValue> {
     if args.len() < 2 {
         return Ok(RespValue::wrong_arity("exists"));
     }
@@ -176,20 +210,23 @@ pub fn cmd_exists(client: &SpiClient, args: &[Bytes]) -> SpiResult<RespValue> {
         let found = client
             .select(
                 "SELECT ( \
-                    EXISTS(SELECT 1 FROM pg_redis_strings WHERE key = $1 AND (expires_at IS NULL OR expires_at > NOW())) \
+                    EXISTS(SELECT 1 FROM pg_redis_strings WHERE db = $1 AND key = $2 AND (expires_at IS NULL OR expires_at > NOW())) \
                     OR ( \
-                        NOT EXISTS(SELECT 1 FROM pg_redis_key_expiry WHERE key = $1 AND expires_at <= NOW()) \
+                        NOT EXISTS(SELECT 1 FROM pg_redis_key_expiry WHERE db = $1 AND key = $2 AND expires_at <= NOW()) \
                         AND ( \
-                            EXISTS(SELECT 1 FROM pg_redis_hashes WHERE key = $1) \
-                            OR EXISTS(SELECT 1 FROM pg_redis_lists WHERE key = $1) \
-                            OR EXISTS(SELECT 1 FROM pg_redis_zsets WHERE key = $1) \
-                            OR EXISTS(SELECT 1 FROM pg_redis_sets WHERE key = $1) \
-                            OR EXISTS(SELECT 1 FROM pg_redis_streams WHERE key = $1) \
+                            EXISTS(SELECT 1 FROM pg_redis_hashes WHERE db = $1 AND key = $2) \
+                            OR EXISTS(SELECT 1 FROM pg_redis_lists WHERE db = $1 AND key = $2) \
+                            OR EXISTS(SELECT 1 FROM pg_redis_zsets WHERE db = $1 AND key = $2) \
+                            OR EXISTS(SELECT 1 FROM pg_redis_sets WHERE db = $1 AND key = $2) \
+                            OR EXISTS(SELECT 1 FROM pg_redis_streams WHERE db = $1 AND key = $2) \
                         ) \
                     ) \
                 )",
                 None,
-                Some(vec![(PgBuiltInOids::TEXTOID.oid(), key.into_datum())]),
+                Some(vec![
+                    (PgBuiltInOids::INT2OID.oid(), db.into_datum()),
+                    (PgBuiltInOids::TEXTOID.oid(), key.into_datum()),
+                ]),
             )?
             .first()
             .get_one::<bool>()?
@@ -247,14 +284,12 @@ fn expire_condition_passes(flags: &ExpireFlags, cur_rem_ms: Option<f64>, new_ttl
         return false;
     }
     if flags.gt {
-        // A key without expiry has infinite TTL, so no finite TTL is greater.
         match cur_rem_ms {
             Some(cur) if (new_ttl_ms as f64) > cur => {}
             _ => return false,
         }
     }
     if flags.lt {
-        // Any finite TTL is strictly less than infinite TTL (None).
         if let Some(cur) = cur_rem_ms {
             if (new_ttl_ms as f64) >= cur {
                 return false;
@@ -267,6 +302,7 @@ fn expire_condition_passes(flags: &ExpireFlags, cur_rem_ms: Option<f64>, new_ttl
 pub fn cmd_expire(
     client: &mut SpiClient,
     cache: Option<&L1Cache>,
+    db: i16,
     args: &[Bytes],
     millis: bool,
     absolute: bool,
@@ -306,9 +342,12 @@ pub fn cmd_expire(
     let str_table = client.select(
         "SELECT EXTRACT(EPOCH FROM (expires_at - NOW()))::DOUBLE PRECISION * 1000.0 \
          FROM pg_redis_strings \
-         WHERE key = $1 AND (expires_at IS NULL OR expires_at > NOW())",
+         WHERE db = $1 AND key = $2 AND (expires_at IS NULL OR expires_at > NOW())",
         None,
-        Some(vec![(PgBuiltInOids::TEXTOID.oid(), key.clone().into_datum())]),
+        Some(vec![
+            (PgBuiltInOids::INT2OID.oid(), db.into_datum()),
+            (PgBuiltInOids::TEXTOID.oid(), key.clone().into_datum()),
+        ]),
     )?;
 
     if !str_table.is_empty() {
@@ -319,17 +358,21 @@ pub fn cmd_expire(
 
         if ttl_ms <= 0 {
             client.update(
-                "DELETE FROM pg_redis_strings WHERE key = $1",
+                "DELETE FROM pg_redis_strings WHERE db = $1 AND key = $2",
                 None,
-                Some(vec![(PgBuiltInOids::TEXTOID.oid(), key.clone().into_datum())]),
+                Some(vec![
+                    (PgBuiltInOids::INT2OID.oid(), db.into_datum()),
+                    (PgBuiltInOids::TEXTOID.oid(), key.clone().into_datum()),
+                ]),
             )?;
         } else {
             client.update(
                 "UPDATE pg_redis_strings \
-                 SET expires_at = NOW() + ($2 * INTERVAL '1 millisecond') \
-                 WHERE key = $1",
+                 SET expires_at = NOW() + ($3 * INTERVAL '1 millisecond') \
+                 WHERE db = $1 AND key = $2",
                 None,
                 Some(vec![
+                    (PgBuiltInOids::INT2OID.oid(), db.into_datum()),
                     (PgBuiltInOids::TEXTOID.oid(), key.clone().into_datum()),
                     (PgBuiltInOids::INT8OID.oid(), ttl_ms.into_datum()),
                 ]),
@@ -337,23 +380,26 @@ pub fn cmd_expire(
         }
 
         if let Some(c) = cache {
-            c.invalidate(&key);
+            c.invalidate(db, &key);
         }
         return Ok(RespValue::Integer(1));
     }
 
     // 2. Check non-string structures (hashes, lists, zsets, sets, streams)
-    purge_if_expired_non_string(client, &key)?;
-    if !non_string_key_exists(client, &key)? {
+    purge_if_expired_non_string(client, db, &key)?;
+    if !non_string_key_exists(client, db, &key)? {
         return Ok(RespValue::Integer(0));
     }
 
     let exp_table = client.select(
         "SELECT EXTRACT(EPOCH FROM (expires_at - NOW()))::DOUBLE PRECISION * 1000.0 \
          FROM pg_redis_key_expiry \
-         WHERE key = $1 AND expires_at > NOW()",
+         WHERE db = $1 AND key = $2 AND expires_at > NOW()",
         None,
-        Some(vec![(PgBuiltInOids::TEXTOID.oid(), key.clone().into_datum())]),
+        Some(vec![
+            (PgBuiltInOids::INT2OID.oid(), db.into_datum()),
+            (PgBuiltInOids::TEXTOID.oid(), key.clone().into_datum()),
+        ]),
     )?;
     let cur_rem_ms: Option<f64> = if exp_table.is_empty() {
         None
@@ -366,14 +412,15 @@ pub fn cmd_expire(
     }
 
     if ttl_ms <= 0 {
-        delete_non_string_key(client, &key)?;
+        delete_non_string_key(client, db, &key)?;
     } else {
         client.update(
-            "INSERT INTO pg_redis_key_expiry (key, expires_at) \
-             VALUES ($1, NOW() + ($2 * INTERVAL '1 millisecond')) \
-             ON CONFLICT (key) DO UPDATE SET expires_at = EXCLUDED.expires_at",
+            "INSERT INTO pg_redis_key_expiry (db, key, expires_at) \
+             VALUES ($1, $2, NOW() + ($3 * INTERVAL '1 millisecond')) \
+             ON CONFLICT (db, key) DO UPDATE SET expires_at = EXCLUDED.expires_at",
             None,
             Some(vec![
+                (PgBuiltInOids::INT2OID.oid(), db.into_datum()),
                 (PgBuiltInOids::TEXTOID.oid(), key.into_datum()),
                 (PgBuiltInOids::INT8OID.oid(), ttl_ms.into_datum()),
             ]),
@@ -383,7 +430,7 @@ pub fn cmd_expire(
     Ok(RespValue::Integer(1))
 }
 
-pub fn cmd_ttl(client: &SpiClient, args: &[Bytes], millis: bool) -> SpiResult<RespValue> {
+pub fn cmd_ttl(client: &SpiClient, db: i16, args: &[Bytes], millis: bool) -> SpiResult<RespValue> {
     if args.len() != 2 {
         return Ok(RespValue::wrong_arity(if millis { "pttl" } else { "ttl" }));
     }
@@ -391,9 +438,12 @@ pub fn cmd_ttl(client: &SpiClient, args: &[Bytes], millis: bool) -> SpiResult<Re
     let table = client.select(
         "SELECT EXTRACT(EPOCH FROM (expires_at - NOW()))::DOUBLE PRECISION \
          FROM pg_redis_strings \
-         WHERE key = $1 AND (expires_at IS NULL OR expires_at > NOW())",
+         WHERE db = $1 AND key = $2 AND (expires_at IS NULL OR expires_at > NOW())",
         None,
-        Some(vec![(PgBuiltInOids::TEXTOID.oid(), key.clone().into_datum())]),
+        Some(vec![
+            (PgBuiltInOids::INT2OID.oid(), db.into_datum()),
+            (PgBuiltInOids::TEXTOID.oid(), key.clone().into_datum()),
+        ]),
     )?;
 
     if !table.is_empty() {
@@ -412,16 +462,19 @@ pub fn cmd_ttl(client: &SpiClient, args: &[Bytes], millis: bool) -> SpiResult<Re
         };
     }
 
-    if !non_string_key_exists(client, &key)? {
+    if !non_string_key_exists(client, db, &key)? {
         return Ok(RespValue::Integer(-2));
     }
 
     let exp_table = client.select(
         "SELECT EXTRACT(EPOCH FROM (expires_at - NOW()))::DOUBLE PRECISION \
          FROM pg_redis_key_expiry \
-         WHERE key = $1 AND expires_at > NOW()",
+         WHERE db = $1 AND key = $2 AND expires_at > NOW()",
         None,
-        Some(vec![(PgBuiltInOids::TEXTOID.oid(), key.into_datum())]),
+        Some(vec![
+            (PgBuiltInOids::INT2OID.oid(), db.into_datum()),
+            (PgBuiltInOids::TEXTOID.oid(), key.into_datum()),
+        ]),
     )?;
 
     if exp_table.is_empty() {
@@ -437,7 +490,12 @@ pub fn cmd_ttl(client: &SpiClient, args: &[Bytes], millis: bool) -> SpiResult<Re
 }
 
 /// `EXPIRETIME key` / `PEXPIRETIME key` — returns absolute Unix expiry timestamp (`-1` persistent, `-2` missing).
-pub fn cmd_expiretime(client: &SpiClient, args: &[Bytes], millis: bool) -> SpiResult<RespValue> {
+pub fn cmd_expiretime(
+    client: &SpiClient,
+    db: i16,
+    args: &[Bytes],
+    millis: bool,
+) -> SpiResult<RespValue> {
     if args.len() != 2 {
         return Ok(RespValue::wrong_arity(if millis {
             "pexpiretime"
@@ -449,9 +507,12 @@ pub fn cmd_expiretime(client: &SpiClient, args: &[Bytes], millis: bool) -> SpiRe
     let table = client.select(
         "SELECT EXTRACT(EPOCH FROM expires_at)::DOUBLE PRECISION \
          FROM pg_redis_strings \
-         WHERE key = $1 AND (expires_at IS NULL OR expires_at > NOW())",
+         WHERE db = $1 AND key = $2 AND (expires_at IS NULL OR expires_at > NOW())",
         None,
-        Some(vec![(PgBuiltInOids::TEXTOID.oid(), key.clone().into_datum())]),
+        Some(vec![
+            (PgBuiltInOids::INT2OID.oid(), db.into_datum()),
+            (PgBuiltInOids::TEXTOID.oid(), key.clone().into_datum()),
+        ]),
     )?;
 
     if !table.is_empty() {
@@ -463,16 +524,19 @@ pub fn cmd_expiretime(client: &SpiClient, args: &[Bytes], millis: bool) -> SpiRe
         }));
     }
 
-    if !non_string_key_exists(client, &key)? {
+    if !non_string_key_exists(client, db, &key)? {
         return Ok(RespValue::Integer(-2));
     }
 
     let exp_table = client.select(
         "SELECT EXTRACT(EPOCH FROM expires_at)::DOUBLE PRECISION \
          FROM pg_redis_key_expiry \
-         WHERE key = $1 AND expires_at > NOW()",
+         WHERE db = $1 AND key = $2 AND expires_at > NOW()",
         None,
-        Some(vec![(PgBuiltInOids::TEXTOID.oid(), key.into_datum())]),
+        Some(vec![
+            (PgBuiltInOids::INT2OID.oid(), db.into_datum()),
+            (PgBuiltInOids::TEXTOID.oid(), key.into_datum()),
+        ]),
     )?;
     if exp_table.is_empty() {
         return Ok(RespValue::Integer(-1));
@@ -488,6 +552,7 @@ pub fn cmd_expiretime(client: &SpiClient, args: &[Bytes], millis: bool) -> SpiRe
 pub fn cmd_persist(
     client: &mut SpiClient,
     cache: Option<&L1Cache>,
+    db: i16,
     args: &[Bytes],
 ) -> SpiResult<RespValue> {
     if args.len() != 2 {
@@ -497,44 +562,53 @@ pub fn cmd_persist(
     let updated = client.update(
         "UPDATE pg_redis_strings \
          SET expires_at = NULL \
-         WHERE key = $1 AND expires_at IS NOT NULL AND expires_at > NOW()",
+         WHERE db = $1 AND key = $2 AND expires_at IS NOT NULL AND expires_at > NOW()",
         None,
-        Some(vec![(PgBuiltInOids::TEXTOID.oid(), key.clone().into_datum())]),
+        Some(vec![
+            (PgBuiltInOids::INT2OID.oid(), db.into_datum()),
+            (PgBuiltInOids::TEXTOID.oid(), key.clone().into_datum()),
+        ]),
     )?;
     if !updated.is_empty() {
         if let Some(c) = cache {
-            c.invalidate(&key);
+            c.invalidate(db, &key);
         }
         return Ok(RespValue::Integer(1));
     }
 
-    purge_if_expired_non_string(client, &key)?;
-    if !non_string_key_exists(client, &key)? {
+    purge_if_expired_non_string(client, db, &key)?;
+    if !non_string_key_exists(client, db, &key)? {
         return Ok(RespValue::Integer(0));
     }
     let removed = client.update(
-        "DELETE FROM pg_redis_key_expiry WHERE key = $1 AND expires_at > NOW()",
+        "DELETE FROM pg_redis_key_expiry WHERE db = $1 AND key = $2 AND expires_at > NOW()",
         None,
-        Some(vec![(PgBuiltInOids::TEXTOID.oid(), key.into_datum())]),
+        Some(vec![
+            (PgBuiltInOids::INT2OID.oid(), db.into_datum()),
+            (PgBuiltInOids::TEXTOID.oid(), key.into_datum()),
+        ]),
     )?;
     Ok(RespValue::Integer(if !removed.is_empty() { 1 } else { 0 }))
 }
 
-fn resolve_key_type(client: &SpiClient, key: &str) -> SpiResult<String> {
+fn resolve_key_type(client: &SpiClient, db: i16, key: &str) -> SpiResult<String> {
     let t: Option<String> = client
         .select(
             "SELECT CASE \
-                WHEN EXISTS(SELECT 1 FROM pg_redis_strings WHERE key = $1 AND (expires_at IS NULL OR expires_at > NOW())) THEN 'string' \
-                WHEN EXISTS(SELECT 1 FROM pg_redis_key_expiry WHERE key = $1 AND expires_at <= NOW()) THEN 'none' \
-                WHEN EXISTS(SELECT 1 FROM pg_redis_hashes WHERE key = $1) THEN 'hash' \
-                WHEN EXISTS(SELECT 1 FROM pg_redis_lists WHERE key = $1) THEN 'list' \
-                WHEN EXISTS(SELECT 1 FROM pg_redis_zsets WHERE key = $1) THEN 'zset' \
-                WHEN EXISTS(SELECT 1 FROM pg_redis_sets WHERE key = $1) THEN 'set' \
-                WHEN EXISTS(SELECT 1 FROM pg_redis_streams WHERE key = $1) THEN 'stream' \
+                WHEN EXISTS(SELECT 1 FROM pg_redis_strings WHERE db = $1 AND key = $2 AND (expires_at IS NULL OR expires_at > NOW())) THEN 'string' \
+                WHEN EXISTS(SELECT 1 FROM pg_redis_key_expiry WHERE db = $1 AND key = $2 AND expires_at <= NOW()) THEN 'none' \
+                WHEN EXISTS(SELECT 1 FROM pg_redis_hashes WHERE db = $1 AND key = $2) THEN 'hash' \
+                WHEN EXISTS(SELECT 1 FROM pg_redis_lists WHERE db = $1 AND key = $2) THEN 'list' \
+                WHEN EXISTS(SELECT 1 FROM pg_redis_zsets WHERE db = $1 AND key = $2) THEN 'zset' \
+                WHEN EXISTS(SELECT 1 FROM pg_redis_sets WHERE db = $1 AND key = $2) THEN 'set' \
+                WHEN EXISTS(SELECT 1 FROM pg_redis_streams WHERE db = $1 AND key = $2) THEN 'stream' \
                 ELSE 'none' \
              END",
             None,
-            Some(vec![(PgBuiltInOids::TEXTOID.oid(), key.into_datum())]),
+            Some(vec![
+                (PgBuiltInOids::INT2OID.oid(), db.into_datum()),
+                (PgBuiltInOids::TEXTOID.oid(), key.into_datum()),
+            ]),
         )?
         .first()
         .get_one::<String>()?;
@@ -542,20 +616,21 @@ fn resolve_key_type(client: &SpiClient, key: &str) -> SpiResult<String> {
     Ok(t.unwrap_or_else(|| "none".to_string()))
 }
 
-pub fn cmd_type(client: &SpiClient, args: &[Bytes]) -> SpiResult<RespValue> {
+pub fn cmd_type(client: &SpiClient, db: i16, args: &[Bytes]) -> SpiResult<RespValue> {
     if args.len() != 2 {
         return Ok(RespValue::wrong_arity("type"));
     }
     let key = as_str(&args[1]);
-    Ok(RespValue::simple(resolve_key_type(client, &key)?))
+    Ok(RespValue::simple(resolve_key_type(client, db, &key)?))
 }
 
-/// `RENAME key newkey` — atomically moves a key (and its TTL) across all catalog tables, overwriting `newkey`.
+/// `RENAME key newkey` — atomically moves a key (and its TTL) within `db`, overwriting `newkey`.
 pub fn cmd_rename(
     client: &mut SpiClient,
     cache: Option<&L1Cache>,
+    db: i16,
     args: &[Bytes],
-    mutated_keys: &mut Vec<String>,
+    mutated_keys: &mut Vec<(i16, String)>,
 ) -> SpiResult<RespValue> {
     if args.len() != 3 {
         return Ok(RespValue::wrong_arity("rename"));
@@ -563,8 +638,8 @@ pub fn cmd_rename(
     let old_key = as_str(&args[1]);
     let new_key = as_str(&args[2]);
 
-    purge_if_expired_non_string(client, &old_key)?;
-    let key_type = resolve_key_type(client, &old_key)?;
+    purge_if_expired_non_string(client, db, &old_key)?;
+    let key_type = resolve_key_type(client, db, &old_key)?;
 
     if key_type == "none" {
         return Ok(RespValue::err("ERR no such key"));
@@ -574,13 +649,16 @@ pub fn cmd_rename(
         return Ok(RespValue::ok());
     }
 
-    // Clear any existing target key across all catalog tables + expiry metadata
+    // Clear any existing target key in `db` across all catalog tables + expiry metadata
     client.update(
-        "DELETE FROM pg_redis_strings WHERE key = $1",
+        "DELETE FROM pg_redis_strings WHERE db = $1 AND key = $2",
         None,
-        Some(vec![(PgBuiltInOids::TEXTOID.oid(), new_key.clone().into_datum())]),
+        Some(vec![
+            (PgBuiltInOids::INT2OID.oid(), db.into_datum()),
+            (PgBuiltInOids::TEXTOID.oid(), new_key.clone().into_datum()),
+        ]),
     )?;
-    delete_non_string_key(client, &new_key)?;
+    delete_non_string_key(client, db, &new_key)?;
 
     let target_table = match key_type.as_str() {
         "string" => "pg_redis_strings",
@@ -592,11 +670,12 @@ pub fn cmd_rename(
         _ => return Ok(RespValue::err("ERR no such key")),
     };
 
-    let upd_sql = format!("UPDATE {target_table} SET key = $2 WHERE key = $1");
+    let upd_sql = format!("UPDATE {target_table} SET key = $3 WHERE db = $1 AND key = $2");
     client.update(
         &upd_sql,
         None,
         Some(vec![
+            (PgBuiltInOids::INT2OID.oid(), db.into_datum()),
             (PgBuiltInOids::TEXTOID.oid(), old_key.clone().into_datum()),
             (PgBuiltInOids::TEXTOID.oid(), new_key.clone().into_datum()),
         ]),
@@ -604,9 +683,10 @@ pub fn cmd_rename(
 
     if key_type != "string" {
         client.update(
-            "UPDATE pg_redis_key_expiry SET key = $2 WHERE key = $1",
+            "UPDATE pg_redis_key_expiry SET key = $3 WHERE db = $1 AND key = $2",
             None,
             Some(vec![
+                (PgBuiltInOids::INT2OID.oid(), db.into_datum()),
                 (PgBuiltInOids::TEXTOID.oid(), old_key.clone().into_datum()),
                 (PgBuiltInOids::TEXTOID.oid(), new_key.clone().into_datum()),
             ]),
@@ -614,58 +694,226 @@ pub fn cmd_rename(
     }
 
     if let Some(c) = cache {
-        c.invalidate(&old_key);
-        c.invalidate(&new_key);
+        c.invalidate(db, &old_key);
+        c.invalidate(db, &new_key);
     }
 
     if matches!(key_type.as_str(), "list" | "zset" | "stream") {
-        mutated_keys.push(new_key);
+        mutated_keys.push((db, new_key));
     }
 
     Ok(RespValue::ok())
 }
 
-fn collect_all_keys(client: &SpiClient, type_filter: Option<&str>) -> SpiResult<Vec<String>> {
+/// `MOVE key db` — atomically moves `key` (and its TTL) from current `db` to `target_db` if absent there.
+pub fn cmd_move(
+    client: &mut SpiClient,
+    cache: Option<&L1Cache>,
+    db: i16,
+    args: &[Bytes],
+    mutated_keys: &mut Vec<(i16, String)>,
+) -> SpiResult<RespValue> {
+    if args.len() != 3 {
+        return Ok(RespValue::wrong_arity("move"));
+    }
+    let key = as_str(&args[1]);
+    let Some(dst_db_i64) = parse_i64(&args[2]) else {
+        return Ok(RespValue::not_integer_err());
+    };
+    if dst_db_i64 < 0 || dst_db_i64 >= config::databases() {
+        return Ok(RespValue::err("ERR DB index is out of range"));
+    }
+    let dst_db = dst_db_i64 as i16;
+    if dst_db == db {
+        return Ok(RespValue::err("ERR source and destination objects are the same"));
+    }
+
+    purge_if_expired_non_string(client, db, &key)?;
+    let src_type = resolve_key_type(client, db, &key)?;
+    if src_type == "none" {
+        return Ok(RespValue::Integer(0));
+    }
+
+    purge_if_expired_non_string(client, dst_db, &key)?;
+    if resolve_key_type(client, dst_db, &key)? != "none" {
+        return Ok(RespValue::Integer(0));
+    }
+
+    // Clear any expired string/non-string tombstones in destination DB before moving
+    client.update(
+        "DELETE FROM pg_redis_strings WHERE db = $1 AND key = $2",
+        None,
+        Some(vec![
+            (PgBuiltInOids::INT2OID.oid(), dst_db.into_datum()),
+            (PgBuiltInOids::TEXTOID.oid(), key.clone().into_datum()),
+        ]),
+    )?;
+    delete_non_string_key(client, dst_db, &key)?;
+
+    let target_table = match src_type.as_str() {
+        "string" => "pg_redis_strings",
+        "hash" => "pg_redis_hashes",
+        "list" => "pg_redis_lists",
+        "zset" => "pg_redis_zsets",
+        "set" => "pg_redis_sets",
+        "stream" => "pg_redis_streams",
+        _ => return Ok(RespValue::Integer(0)),
+    };
+
+    let upd_sql = format!("UPDATE {target_table} SET db = $3 WHERE db = $1 AND key = $2");
+    client.update(
+        &upd_sql,
+        None,
+        Some(vec![
+            (PgBuiltInOids::INT2OID.oid(), db.into_datum()),
+            (PgBuiltInOids::TEXTOID.oid(), key.clone().into_datum()),
+            (PgBuiltInOids::INT2OID.oid(), dst_db.into_datum()),
+        ]),
+    )?;
+
+    if src_type != "string" {
+        client.update(
+            "UPDATE pg_redis_key_expiry SET db = $3 WHERE db = $1 AND key = $2",
+            None,
+            Some(vec![
+                (PgBuiltInOids::INT2OID.oid(), db.into_datum()),
+                (PgBuiltInOids::TEXTOID.oid(), key.clone().into_datum()),
+                (PgBuiltInOids::INT2OID.oid(), dst_db.into_datum()),
+            ]),
+        )?;
+    }
+
+    if let Some(c) = cache {
+        c.invalidate(db, &key);
+        c.invalidate(dst_db, &key);
+    }
+
+    if matches!(src_type.as_str(), "list" | "zset" | "stream") {
+        mutated_keys.push((dst_db, key));
+    }
+
+    Ok(RespValue::Integer(1))
+}
+
+/// `SWAPDB index1 index2` — atomically swaps all keys and expiries between two Redis databases.
+pub fn cmd_swapdb(
+    client: &mut SpiClient,
+    cache: Option<&L1Cache>,
+    args: &[Bytes],
+) -> SpiResult<RespValue> {
+    if args.len() != 3 {
+        return Ok(RespValue::wrong_arity("swapdb"));
+    }
+    let Some(db1_i64) = parse_i64(&args[1]) else {
+        return Ok(RespValue::err("ERR invalid first DB index"));
+    };
+    let Some(db2_i64) = parse_i64(&args[2]) else {
+        return Ok(RespValue::err("ERR invalid second DB index"));
+    };
+    let max_dbs = config::databases();
+    if db1_i64 < 0 || db1_i64 >= max_dbs {
+        return Ok(RespValue::err("ERR invalid first DB index"));
+    }
+    if db2_i64 < 0 || db2_i64 >= max_dbs {
+        return Ok(RespValue::err("ERR invalid second DB index"));
+    }
+    if db1_i64 == db2_i64 {
+        return Ok(RespValue::ok());
+    }
+
+    let db1 = db1_i64 as i16;
+    let db2 = db2_i64 as i16;
+    let tmp: i16 = -1;
+
+    for tbl in ALL_TABLES_CANONICAL {
+        let s1 = format!("UPDATE {tbl} SET db = $1 WHERE db = $2");
+        client.update(
+            &s1,
+            None,
+            Some(vec![
+                (PgBuiltInOids::INT2OID.oid(), tmp.into_datum()),
+                (PgBuiltInOids::INT2OID.oid(), db1.into_datum()),
+            ]),
+        )?;
+        client.update(
+            &s1,
+            None,
+            Some(vec![
+                (PgBuiltInOids::INT2OID.oid(), db1.into_datum()),
+                (PgBuiltInOids::INT2OID.oid(), db2.into_datum()),
+            ]),
+        )?;
+        client.update(
+            &s1,
+            None,
+            Some(vec![
+                (PgBuiltInOids::INT2OID.oid(), db2.into_datum()),
+                (PgBuiltInOids::INT2OID.oid(), tmp.into_datum()),
+            ]),
+        )?;
+    }
+
+    if let Some(c) = cache {
+        c.clear();
+    }
+
+    Ok(RespValue::ok())
+}
+
+fn collect_all_keys(
+    client: &SpiClient,
+    db: i16,
+    type_filter: Option<&str>,
+) -> SpiResult<Vec<String>> {
     let sql = match type_filter {
         None => {
-            "SELECT key FROM pg_redis_strings WHERE expires_at IS NULL OR expires_at > NOW() \
+            "SELECT key FROM pg_redis_strings WHERE db = $1 AND (expires_at IS NULL OR expires_at > NOW()) \
              UNION \
              SELECT key FROM ( \
-                SELECT DISTINCT key FROM pg_redis_hashes \
-                UNION SELECT DISTINCT key FROM pg_redis_lists \
-                UNION SELECT DISTINCT key FROM pg_redis_zsets \
-                UNION SELECT DISTINCT key FROM pg_redis_sets \
-                UNION SELECT DISTINCT key FROM pg_redis_streams \
+                SELECT DISTINCT key FROM pg_redis_hashes WHERE db = $1 \
+                UNION SELECT DISTINCT key FROM pg_redis_lists WHERE db = $1 \
+                UNION SELECT DISTINCT key FROM pg_redis_zsets WHERE db = $1 \
+                UNION SELECT DISTINCT key FROM pg_redis_sets WHERE db = $1 \
+                UNION SELECT DISTINCT key FROM pg_redis_streams WHERE db = $1 \
              ) ns \
-             WHERE NOT EXISTS (SELECT 1 FROM pg_redis_key_expiry e WHERE e.key = ns.key AND e.expires_at <= NOW())"
+             WHERE NOT EXISTS (SELECT 1 FROM pg_redis_key_expiry e WHERE e.db = $1 AND e.key = ns.key AND e.expires_at <= NOW())"
         }
         Some("string") => {
-            "SELECT key FROM pg_redis_strings WHERE expires_at IS NULL OR expires_at > NOW()"
+            "SELECT key FROM pg_redis_strings WHERE db = $1 AND (expires_at IS NULL OR expires_at > NOW())"
         }
         Some("hash") => {
             "SELECT DISTINCT h.key FROM pg_redis_hashes h \
-             WHERE NOT EXISTS (SELECT 1 FROM pg_redis_key_expiry e WHERE e.key = h.key AND e.expires_at <= NOW())"
+             WHERE h.db = $1 \
+               AND NOT EXISTS (SELECT 1 FROM pg_redis_key_expiry e WHERE e.db = $1 AND e.key = h.key AND e.expires_at <= NOW())"
         }
         Some("list") => {
             "SELECT DISTINCT l.key FROM pg_redis_lists l \
-             WHERE NOT EXISTS (SELECT 1 FROM pg_redis_key_expiry e WHERE e.key = l.key AND e.expires_at <= NOW())"
+             WHERE l.db = $1 \
+               AND NOT EXISTS (SELECT 1 FROM pg_redis_key_expiry e WHERE e.db = $1 AND e.key = l.key AND e.expires_at <= NOW())"
         }
         Some("zset") => {
             "SELECT DISTINCT z.key FROM pg_redis_zsets z \
-             WHERE NOT EXISTS (SELECT 1 FROM pg_redis_key_expiry e WHERE e.key = z.key AND e.expires_at <= NOW())"
+             WHERE z.db = $1 \
+               AND NOT EXISTS (SELECT 1 FROM pg_redis_key_expiry e WHERE e.db = $1 AND e.key = z.key AND e.expires_at <= NOW())"
         }
         Some("set") => {
             "SELECT DISTINCT s.key FROM pg_redis_sets s \
-             WHERE NOT EXISTS (SELECT 1 FROM pg_redis_key_expiry e WHERE e.key = s.key AND e.expires_at <= NOW())"
+             WHERE s.db = $1 \
+               AND NOT EXISTS (SELECT 1 FROM pg_redis_key_expiry e WHERE e.db = $1 AND e.key = s.key AND e.expires_at <= NOW())"
         }
         Some("stream") => {
             "SELECT DISTINCT x.key FROM pg_redis_streams x \
-             WHERE NOT EXISTS (SELECT 1 FROM pg_redis_key_expiry e WHERE e.key = x.key AND e.expires_at <= NOW())"
+             WHERE x.db = $1 \
+               AND NOT EXISTS (SELECT 1 FROM pg_redis_key_expiry e WHERE e.db = $1 AND e.key = x.key AND e.expires_at <= NOW())"
         }
         Some(_) => return Ok(Vec::new()),
     };
 
-    let table = client.select(sql, None, None)?;
+    let table = client.select(
+        sql,
+        None,
+        Some(vec![(PgBuiltInOids::INT2OID.oid(), db.into_datum())]),
+    )?;
 
     let mut keys = BTreeSet::new();
     for row in table {
@@ -676,12 +924,12 @@ fn collect_all_keys(client: &SpiClient, type_filter: Option<&str>) -> SpiResult<
     Ok(keys.into_iter().collect())
 }
 
-pub fn cmd_keys(client: &SpiClient, args: &[Bytes]) -> SpiResult<RespValue> {
+pub fn cmd_keys(client: &SpiClient, db: i16, args: &[Bytes]) -> SpiResult<RespValue> {
     if args.len() != 2 {
         return Ok(RespValue::wrong_arity("keys"));
     }
     let pattern = as_str(&args[1]);
-    let all_keys = collect_all_keys(client, None)?;
+    let all_keys = collect_all_keys(client, db, None)?;
     let matched = all_keys
         .into_iter()
         .filter(|k| glob_match(&pattern, k))
@@ -690,7 +938,7 @@ pub fn cmd_keys(client: &SpiClient, args: &[Bytes]) -> SpiResult<RespValue> {
     Ok(RespValue::Array(matched))
 }
 
-pub fn cmd_scan(client: &SpiClient, args: &[Bytes]) -> SpiResult<RespValue> {
+pub fn cmd_scan(client: &SpiClient, db: i16, args: &[Bytes]) -> SpiResult<RespValue> {
     if args.len() < 2 {
         return Ok(RespValue::wrong_arity("scan"));
     }
@@ -740,7 +988,7 @@ pub fn cmd_scan(client: &SpiClient, args: &[Bytes]) -> SpiResult<RespValue> {
         }
     }
 
-    let all_keys = collect_all_keys(client, type_filter.as_deref())?;
+    let all_keys = collect_all_keys(client, db, type_filter.as_deref())?;
     let start = cursor as usize;
     let end = (start + count).min(all_keys.len());
     let next_cursor = if end >= all_keys.len() { 0 } else { end };
@@ -763,23 +1011,61 @@ pub fn cmd_scan(client: &SpiClient, args: &[Bytes]) -> SpiResult<RespValue> {
     ]))
 }
 
-pub fn cmd_dbsize(client: &SpiClient) -> SpiResult<RespValue> {
-    let count = collect_all_keys(client, None)?.len() as i64;
+pub fn cmd_dbsize(client: &SpiClient, db: i16) -> SpiResult<RespValue> {
+    let count = collect_all_keys(client, db, None)?.len() as i64;
     Ok(RespValue::Integer(count))
 }
 
-pub fn cmd_flushdb(client: &mut SpiClient, cache: Option<&L1Cache>) -> SpiResult<RespValue> {
-    client.update(
-        "DELETE FROM pg_redis_strings; \
-         DELETE FROM pg_redis_hashes; \
-         DELETE FROM pg_redis_lists; \
-         DELETE FROM pg_redis_zsets; \
-         DELETE FROM pg_redis_sets; \
-         DELETE FROM pg_redis_streams; \
-         DELETE FROM pg_redis_key_expiry;",
-        None,
-        None,
-    )?;
+fn validate_flush_args(args: &[Bytes]) -> Result<(), RespValue> {
+    if args.len() == 1 {
+        return Ok(());
+    }
+    if args.len() == 2 {
+        let opt = as_str(&args[1]).to_uppercase();
+        if matches!(opt.as_str(), "ASYNC" | "SYNC") {
+            return Ok(());
+        }
+    }
+    Err(RespValue::syntax_err())
+}
+
+/// `FLUSHDB [ASYNC|SYNC]` — deletes all keys in the currently selected DB only.
+pub fn cmd_flushdb(
+    client: &mut SpiClient,
+    cache: Option<&L1Cache>,
+    db: i16,
+    args: &[Bytes],
+) -> SpiResult<RespValue> {
+    if let Err(e) = validate_flush_args(args) {
+        return Ok(e);
+    }
+    for tbl in ALL_TABLES_CANONICAL {
+        let sql = format!("DELETE FROM {tbl} WHERE db = $1");
+        client.update(
+            &sql,
+            None,
+            Some(vec![(PgBuiltInOids::INT2OID.oid(), db.into_datum())]),
+        )?;
+    }
+    if let Some(c) = cache {
+        c.clear();
+    }
+    Ok(RespValue::ok())
+}
+
+/// `FLUSHALL [ASYNC|SYNC]` — deletes all keys across every logical Redis database.
+pub fn cmd_flushall(
+    client: &mut SpiClient,
+    cache: Option<&L1Cache>,
+    args: &[Bytes],
+) -> SpiResult<RespValue> {
+    if let Err(e) = validate_flush_args(args) {
+        return Ok(e);
+    }
+    for tbl in ALL_TABLES_CANONICAL {
+        let sql = format!("DELETE FROM {tbl}");
+        client.update(&sql, None, None)?;
+    }
     if let Some(c) = cache {
         c.clear();
     }
@@ -799,56 +1085,67 @@ fn glob_match_slice(p: &[char], t: &[char]) -> bool {
     }
     match p[0] {
         '*' => {
-            let mut pi = 1;
-            while pi < p.len() && p[pi] == '*' {
-                pi += 1;
+            let mut next_p = 1;
+            while next_p < p.len() && p[next_p] == '*' {
+                next_p += 1;
             }
-            if pi == p.len() {
+            if next_p == p.len() {
                 return true;
             }
-            for ti in 0..=t.len() {
-                if glob_match_slice(&p[pi..], &t[ti..]) {
+            for i in 0..=t.len() {
+                if glob_match_slice(&p[next_p..], &t[i..]) {
                     return true;
                 }
             }
             false
         }
         '?' => !t.is_empty() && glob_match_slice(&p[1..], &t[1..]),
+        '\\' => {
+            if p.len() >= 2 {
+                !t.is_empty() && t[0] == p[1] && glob_match_slice(&p[2..], &t[1..])
+            } else {
+                !t.is_empty() && t[0] == '\\' && glob_match_slice(&p[1..], &t[1..])
+            }
+        }
         '[' => {
             if t.is_empty() {
                 return false;
             }
-            let mut pi = 1;
-            let negated = pi < p.len() && p[pi] == '^';
-            if negated {
-                pi += 1;
-            }
+            let mut idx = 1;
+            let negate = if idx < p.len() && p[idx] == '^' {
+                idx += 1;
+                true
+            } else {
+                false
+            };
             let mut matched = false;
             let ch = t[0];
-            while pi < p.len() && p[pi] != ']' {
-                if pi + 2 < p.len() && p[pi + 1] == '-' && p[pi + 2] != ']' {
-                    if ch >= p[pi] && ch <= p[pi + 2] {
+            while idx < p.len() && p[idx] != ']' {
+                if p[idx] == '\\' && idx + 1 < p.len() {
+                    if p[idx + 1] == ch {
                         matched = true;
                     }
-                    pi += 3;
+                    idx += 2;
+                } else if idx + 2 < p.len() && p[idx + 1] == '-' && p[idx + 2] != ']' {
+                    if ch >= p[idx] && ch <= p[idx + 2] {
+                        matched = true;
+                    }
+                    idx += 3;
                 } else {
-                    if ch == p[pi] {
+                    if p[idx] == ch {
                         matched = true;
                     }
-                    pi += 1;
+                    idx += 1;
                 }
             }
-            if pi >= p.len() || p[pi] != ']' {
-                return false;
+            if idx < p.len() && p[idx] == ']' {
+                idx += 1;
             }
-            if negated {
+            if negate {
                 matched = !matched;
             }
-            matched && glob_match_slice(&p[pi + 1..], &t[1..])
+            matched && glob_match_slice(&p[idx..], &t[1..])
         }
-        '\\' if p.len() >= 2 => {
-            !t.is_empty() && p[1] == t[0] && glob_match_slice(&p[2..], &t[1..])
-        }
-        c => !t.is_empty() && c == t[0] && glob_match_slice(&p[1..], &t[1..]),
+        c => !t.is_empty() && t[0] == c && glob_match_slice(&p[1..], &t[1..]),
     }
 }

@@ -20,9 +20,11 @@ extension_sql!(
     r#"
 -- 1. Strings (SET, GET, INCR, DEL)
 CREATE TABLE IF NOT EXISTS pg_redis_strings (
-    key TEXT PRIMARY KEY,
+    db SMALLINT NOT NULL DEFAULT 0,
+    key TEXT,
     value BYTEA,
-    expires_at TIMESTAMPTZ
+    expires_at TIMESTAMPTZ,
+    PRIMARY KEY (db, key)
 ) WITH (fillfactor = 80);
 
 CREATE INDEX IF NOT EXISTS idx_redis_strings_expiry
@@ -31,63 +33,70 @@ WHERE expires_at IS NOT NULL;
 
 -- 2. Hashes (HSET, HGET, HGETALL, HDEL)
 CREATE TABLE IF NOT EXISTS pg_redis_hashes (
+    db SMALLINT NOT NULL DEFAULT 0,
     key TEXT,
     field TEXT,
     value TEXT,
-    PRIMARY KEY (key, field)
+    PRIMARY KEY (db, key, field)
 ) WITH (fillfactor = 80);
 
 CREATE INDEX IF NOT EXISTS idx_redis_hashes_key
-ON pg_redis_hashes(key);
+ON pg_redis_hashes(db, key);
 
 -- 3. Lists (LPUSH, RPUSH, LPOP, RPOP, LRANGE)
 CREATE TABLE IF NOT EXISTS pg_redis_lists (
+    db SMALLINT NOT NULL DEFAULT 0,
     key TEXT,
     seq BIGSERIAL,
     value TEXT,
-    PRIMARY KEY (key, seq)
+    PRIMARY KEY (db, key, seq)
 ) WITH (fillfactor = 80);
 
 CREATE INDEX IF NOT EXISTS idx_redis_lists_key_seq
-ON pg_redis_lists(key, seq);
+ON pg_redis_lists(db, key, seq);
 
 -- 4. Sorted Sets (ZADD, ZRANGE, ZREM, ZSCORE, ZPOPMIN)
 CREATE TABLE IF NOT EXISTS pg_redis_zsets (
+    db SMALLINT NOT NULL DEFAULT 0,
     key TEXT,
     member TEXT,
     score DOUBLE PRECISION,
-    PRIMARY KEY (key, member)
+    PRIMARY KEY (db, key, member)
 ) WITH (fillfactor = 80);
 
 CREATE INDEX IF NOT EXISTS idx_redis_zsets_score
-ON pg_redis_zsets(key, score);
+ON pg_redis_zsets(db, key, score);
 
 -- 5. Sets (SADD, SREM, SMEMBERS, SISMEMBER, SCARD)
 CREATE TABLE IF NOT EXISTS pg_redis_sets (
+    db SMALLINT NOT NULL DEFAULT 0,
     key TEXT,
     member TEXT,
-    PRIMARY KEY (key, member)
+    PRIMARY KEY (db, key, member)
 ) WITH (fillfactor = 80);
 
 CREATE INDEX IF NOT EXISTS idx_redis_sets_key
-ON pg_redis_sets(key);
+ON pg_redis_sets(db, key);
 
 -- 6. Streams (XADD, XTRIM, XREAD, XRANGE, XREVRANGE, XLEN, XDEL)
 CREATE TABLE IF NOT EXISTS pg_redis_streams (
+    db SMALLINT NOT NULL DEFAULT 0,
     key TEXT,
     ms BIGINT,
     seq BIGINT,
     fields TEXT,
-    PRIMARY KEY (key, ms, seq)
+    PRIMARY KEY (db, key, ms, seq)
 ) WITH (fillfactor = 80);
 
 CREATE INDEX IF NOT EXISTS idx_redis_streams_key_id
-ON pg_redis_streams(key, ms, seq);
+ON pg_redis_streams(db, key, ms, seq);
 
 -- 7. Key Expiry for non-string structures (Hashes, Lists, ZSets, Sets, Streams)
 CREATE TABLE IF NOT EXISTS pg_redis_key_expiry (
-    key TEXT PRIMARY KEY,
-    expires_at TIMESTAMPTZ NOT NULL
+    db SMALLINT NOT NULL DEFAULT 0,
+    key TEXT,
+    expires_at TIMESTAMPTZ NOT NULL,
+    PRIMARY KEY (db, key)
 ) WITH (fillfactor = 80);
 
 CREATE INDEX IF NOT EXISTS idx_redis_key_expiry_at
@@ -714,6 +723,133 @@ mod tests {
         );
         assert!(cfg_tls.contains("tls-port"), "cfg_tls={cfg_tls}");
         assert!(cfg_tls.contains("tls-auth-clients"), "cfg_tls={cfg_tls}");
+    }
+
+    #[pg_test]
+    fn test_multi_database_isolation_and_ops() {
+        use bytes::Bytes;
+
+        assert_eq!(crate::config::databases(), 16);
+        let cfg_dbs = crate::redis_dispatcher(
+            "CONFIG".to_string(),
+            Some("GET".to_string()),
+            Some("databases".to_string()),
+            None,
+        );
+        assert!(cfg_dbs.contains("$2\r\n16\r\n"), "cfg_dbs={cfg_dbs}");
+
+        let mut conn = crate::commands::ConnectionState::new(999);
+        let cache = crate::cache::L1Cache::new(100);
+        let mut mutated = Vec::new();
+
+        let run = |conn: &mut crate::commands::ConnectionState,
+                   mutated: &mut Vec<(i16, String)>,
+                   parts: &[&str]|
+         -> String {
+            let args: Vec<Bytes> = parts.iter().map(|s| Bytes::from(s.to_string())).collect();
+            Spi::connect(|mut client| {
+                crate::commands::dispatch_with_spi(
+                    &mut client,
+                    None,
+                    Some(&cache),
+                    None,
+                    None,
+                    None,
+                    conn,
+                    &args,
+                    mutated,
+                )
+            })
+            .unwrap()
+            .to_resp2_string()
+        };
+
+        // Write same key in DB 0 and DB 1 with different values
+        assert_eq!(run(&mut conn, &mut mutated, &["SELECT", "0"]), "+OK\r\n");
+        assert_eq!(
+            run(&mut conn, &mut mutated, &["SET", "multi:k", "val_db0"]),
+            "+OK\r\n"
+        );
+        assert_eq!(run(&mut conn, &mut mutated, &["SELECT", "1"]), "+OK\r\n");
+        assert_eq!(
+            run(&mut conn, &mut mutated, &["SET", "multi:k", "val_db1"]),
+            "+OK\r\n"
+        );
+        assert_eq!(
+            run(&mut conn, &mut mutated, &["HSET", "multi:h", "f", "h_db1"]),
+            ":1\r\n"
+        );
+        assert_eq!(
+            run(&mut conn, &mut mutated, &["EXPIRE", "multi:h", "120"]),
+            ":1\r\n"
+        );
+
+        // Out-of-range SELECT fails cleanly
+        assert!(run(&mut conn, &mut mutated, &["SELECT", "16"]).starts_with("-ERR"));
+        assert!(run(&mut conn, &mut mutated, &["SELECT", "-1"]).starts_with("-ERR"));
+
+        // Verify isolation (including L1 cache isolation!)
+        assert_eq!(
+            run(&mut conn, &mut mutated, &["GET", "multi:k"]),
+            "$7\r\nval_db1\r\n"
+        );
+        assert_eq!(run(&mut conn, &mut mutated, &["SELECT", "0"]), "+OK\r\n");
+        assert_eq!(
+            run(&mut conn, &mut mutated, &["GET", "multi:k"]),
+            "$7\r\nval_db0\r\n"
+        );
+        assert_eq!(
+            run(&mut conn, &mut mutated, &["HGET", "multi:h", "f"]),
+            "$-1\r\n"
+        );
+
+        // MOVE hash + its TTL from DB 1 to DB 2
+        assert_eq!(run(&mut conn, &mut mutated, &["SELECT", "1"]), "+OK\r\n");
+        assert_eq!(
+            run(&mut conn, &mut mutated, &["MOVE", "multi:h", "2"]),
+            ":1\r\n"
+        );
+        assert_eq!(
+            run(&mut conn, &mut mutated, &["HGET", "multi:h", "f"]),
+            "$-1\r\n"
+        );
+        assert_eq!(run(&mut conn, &mut mutated, &["SELECT", "2"]), "+OK\r\n");
+        assert_eq!(
+            run(&mut conn, &mut mutated, &["HGET", "multi:h", "f"]),
+            "$5\r\nh_db1\r\n"
+        );
+        let ttl_db2 = run(&mut conn, &mut mutated, &["TTL", "multi:h"]);
+        assert!(
+            ttl_db2.starts_with(':') && !ttl_db2.starts_with(":-"),
+            "expected positive TTL after MOVE, got {ttl_db2}"
+        );
+
+        // SWAPDB 0 1 swaps values cleanly
+        assert_eq!(run(&mut conn, &mut mutated, &["SWAPDB", "0", "1"]), "+OK\r\n");
+        assert_eq!(run(&mut conn, &mut mutated, &["SELECT", "0"]), "+OK\r\n");
+        assert_eq!(
+            run(&mut conn, &mut mutated, &["GET", "multi:k"]),
+            "$7\r\nval_db1\r\n"
+        );
+        assert_eq!(run(&mut conn, &mut mutated, &["SELECT", "1"]), "+OK\r\n");
+        assert_eq!(
+            run(&mut conn, &mut mutated, &["GET", "multi:k"]),
+            "$7\r\nval_db0\r\n"
+        );
+
+        // FLUSHDB in DB 1 does NOT affect DB 0 or DB 2
+        assert_eq!(run(&mut conn, &mut mutated, &["FLUSHDB"]), "+OK\r\n");
+        assert_eq!(run(&mut conn, &mut mutated, &["GET", "multi:k"]), "$-1\r\n");
+        assert_eq!(run(&mut conn, &mut mutated, &["SELECT", "0"]), "+OK\r\n");
+        assert_eq!(
+            run(&mut conn, &mut mutated, &["GET", "multi:k"]),
+            "$7\r\nval_db1\r\n"
+        );
+        assert_eq!(run(&mut conn, &mut mutated, &["SELECT", "2"]), "+OK\r\n");
+        assert_eq!(
+            run(&mut conn, &mut mutated, &["HGET", "multi:h", "f"]),
+            "$5\r\nh_db1\r\n"
+        );
     }
 }
 

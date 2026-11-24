@@ -4,11 +4,11 @@ use std::rc::Rc;
 use tokio::sync::Notify;
 
 /// Lightweight single-threaded key notification hub for blocking commands
-/// (`BZPOPMIN`, `BZPOPMAX`, `BLPOP`, `BRPOP`, `XREAD BLOCK`).
+/// (`BZPOPMIN`, `BZPOPMAX`, `BLPOP`, `BRPOP`, `XREAD BLOCK`), scoped per `(db, key)`.
 ///
 /// Runs exclusively on the background worker's `LocalSet` OS thread.
 pub struct KeyNotifier {
-    waiters: RefCell<HashMap<String, Rc<Notify>>>,
+    waiters: RefCell<HashMap<(i16, String), Rc<Notify>>>,
 }
 
 impl KeyNotifier {
@@ -18,16 +18,16 @@ impl KeyNotifier {
         }
     }
 
-    /// Wake all tasks currently blocked waiting on `key`.
+    /// Wake all tasks currently blocked waiting on `(db, key)`.
     #[allow(dead_code)]
-    pub fn notify_key(&self, key: &str) {
-        if let Some(n) = self.waiters.borrow().get(key) {
+    pub fn notify_key(&self, db: i16, key: &str) {
+        if let Some(n) = self.waiters.borrow().get(&(db, key.to_string())) {
             n.notify_waiters();
         }
     }
 
-    /// Wake tasks for every mutated key in `keys`.
-    pub fn notify_many(&self, keys: &[String]) {
+    /// Wake tasks for every mutated `(db, key)` pair.
+    pub fn notify_many(&self, keys: &[(i16, String)]) {
         if keys.is_empty() {
             return;
         }
@@ -39,13 +39,13 @@ impl KeyNotifier {
         }
     }
 
-    /// Acquire or create the `Notify` handles for a set of watched keys.
-    pub fn get_notifiers(&self, keys: &[String]) -> Vec<Rc<Notify>> {
+    /// Acquire or create the `Notify` handles for a set of watched keys in `db`.
+    pub fn get_notifiers(&self, db: i16, keys: &[String]) -> Vec<Rc<Notify>> {
         let mut map = self.waiters.borrow_mut();
         keys.iter()
             .map(|k| {
                 Rc::clone(
-                    map.entry(k.clone())
+                    map.entry((db, k.clone()))
                         .or_insert_with(|| Rc::new(Notify::new())),
                 )
             })
@@ -53,12 +53,13 @@ impl KeyNotifier {
     }
 
     /// Clean up unused `Notify` entries whose only remaining reference is the map itself.
-    pub fn gc_keys(&self, keys: &[String]) {
+    pub fn gc_keys(&self, db: i16, keys: &[String]) {
         let mut map = self.waiters.borrow_mut();
         for k in keys {
-            if let Some(n) = map.get(k) {
+            let key = (db, k.clone());
+            if let Some(n) = map.get(&key) {
                 if Rc::strong_count(n) <= 1 {
-                    map.remove(k);
+                    map.remove(&key);
                 }
             }
         }

@@ -407,6 +407,28 @@ const [, hashKeys] = await redis.scan("0", "MATCH", "cart:*", "TYPE", "hash");
 const clients = await redis.client("LIST", "TYPE", "normal");
 ```
 
+## Multiple Logical Databases (`SELECT 0`–`15`)
+
+`pg_redis_core` ships with `pg_redis.databases = 16` by default (configurable up to `1024`), so you can isolate workloads across numbered databases just like standard Redis:
+
+```javascript
+import Redis from "ioredis";
+
+const cacheDb = new Redis("redis://localhost:6379/0");
+const queueDb = new Redis("redis://localhost:6379/1");
+
+await cacheDb.set("config:version", "v1");
+await queueDb.set("config:version", "v2");
+
+console.log(await cacheDb.get("config:version")); // "v1"
+console.log(await queueDb.get("config:version")); // "v2"
+
+// Move a key (with its TTL) to DB 2, swap DBs, or flush only one DB
+await cacheDb.move("config:version", 2);
+await cacheDb.swapdb(1, 2);
+await queueDb.flushdb(); // clears DB 1 only; DB 0 & DB 2 stay intact
+```
+
 ## Sandboxed Lua 5.1 Scripting
 
 Execute atomic multi-key logic inside a single PostgreSQL SPI transaction with `cjson`, `cmsgpack`, and `bit` built in — protected by the restricted Lua 5.1 sandbox and `pg_redis.lua_time_limit_ms`:

@@ -26,6 +26,7 @@ fn parse_f64(b: &Bytes) -> Option<f64> {
 pub fn cmd_hset(
     client: &mut SpiClient,
     plans: Option<&PreparedPlans>,
+    db: i16,
     args: &[Bytes],
     hmset: bool,
 ) -> SpiResult<RespValue> {
@@ -35,7 +36,7 @@ pub fn cmd_hset(
     }
 
     let key = as_str(&args[1]);
-    keys::purge_if_expired_non_string(client, &key)?;
+    keys::purge_if_expired_non_string(client, db, &key)?;
     let mut added: i64 = 0;
 
     for pair in args[2..].chunks_exact(2) {
@@ -46,12 +47,18 @@ pub fn cmd_hset(
             Some(p) => client.update(
                 &p.hash_upsert,
                 None,
-                Some(vec![key.clone().into_datum(), field.into_datum(), value.into_datum()]),
+                Some(vec![
+                    db.into_datum(),
+                    key.clone().into_datum(),
+                    field.into_datum(),
+                    value.into_datum(),
+                ]),
             )?,
             None => client.update(
                 SQL_HASH_UPSERT,
                 None,
                 Some(vec![
+                    (PgBuiltInOids::INT2OID.oid(), db.into_datum()),
                     (PgBuiltInOids::TEXTOID.oid(), key.clone().into_datum()),
                     (PgBuiltInOids::TEXTOID.oid(), field.into_datum()),
                     (PgBuiltInOids::TEXTOID.oid(), value.into_datum()),
@@ -72,20 +79,21 @@ pub fn cmd_hset(
     }
 }
 
-pub fn cmd_hsetnx(client: &mut SpiClient, args: &[Bytes]) -> SpiResult<RespValue> {
+pub fn cmd_hsetnx(client: &mut SpiClient, db: i16, args: &[Bytes]) -> SpiResult<RespValue> {
     if args.len() != 4 {
         return Ok(RespValue::wrong_arity("hsetnx"));
     }
     let key = as_str(&args[1]);
-    keys::purge_if_expired_non_string(client, &key)?;
+    keys::purge_if_expired_non_string(client, db, &key)?;
     let field = as_str(&args[2]);
     let value = as_str(&args[3]);
     let res = client.update(
-        "INSERT INTO pg_redis_hashes (key, field, value) \
-         VALUES ($1, $2, $3) \
-         ON CONFLICT (key, field) DO NOTHING",
+        "INSERT INTO pg_redis_hashes (db, key, field, value) \
+         VALUES ($1, $2, $3, $4) \
+         ON CONFLICT (db, key, field) DO NOTHING",
         None,
         Some(vec![
+            (PgBuiltInOids::INT2OID.oid(), db.into_datum()),
             (PgBuiltInOids::TEXTOID.oid(), key.into_datum()),
             (PgBuiltInOids::TEXTOID.oid(), field.into_datum()),
             (PgBuiltInOids::TEXTOID.oid(), value.into_datum()),
@@ -97,6 +105,7 @@ pub fn cmd_hsetnx(client: &mut SpiClient, args: &[Bytes]) -> SpiResult<RespValue
 pub fn cmd_hget(
     client: &SpiClient,
     plans: Option<&PreparedPlans>,
+    db: i16,
     args: &[Bytes],
 ) -> SpiResult<RespValue> {
     if args.len() != 3 {
@@ -104,7 +113,7 @@ pub fn cmd_hget(
     }
     let key = as_str(&args[1]);
     let field = as_str(&args[2]);
-    if keys::is_non_string_expired(client, &key)? {
+    if keys::is_non_string_expired(client, db, &key)? {
         return Ok(RespValue::Null);
     }
 
@@ -112,12 +121,13 @@ pub fn cmd_hget(
         Some(p) => client.select(
             &p.hash_get,
             None,
-            Some(vec![key.into_datum(), field.into_datum()]),
+            Some(vec![db.into_datum(), key.into_datum(), field.into_datum()]),
         )?,
         None => client.select(
             SQL_HASH_GET,
             None,
             Some(vec![
+                (PgBuiltInOids::INT2OID.oid(), db.into_datum()),
                 (PgBuiltInOids::TEXTOID.oid(), key.into_datum()),
                 (PgBuiltInOids::TEXTOID.oid(), field.into_datum()),
             ]),
@@ -136,13 +146,14 @@ pub fn cmd_hget(
 pub fn cmd_hmget(
     client: &SpiClient,
     plans: Option<&PreparedPlans>,
+    db: i16,
     args: &[Bytes],
 ) -> SpiResult<RespValue> {
     if args.len() < 3 {
         return Ok(RespValue::wrong_arity("hmget"));
     }
     let key = as_str(&args[1]);
-    if keys::is_non_string_expired(client, &key)? {
+    if keys::is_non_string_expired(client, db, &key)? {
         return Ok(RespValue::Array(vec![RespValue::Null; args.len() - 2]));
     }
     let mut out = Vec::with_capacity(args.len() - 2);
@@ -153,12 +164,17 @@ pub fn cmd_hmget(
             Some(p) => client.select(
                 &p.hash_get,
                 None,
-                Some(vec![key.clone().into_datum(), field.into_datum()]),
+                Some(vec![
+                    db.into_datum(),
+                    key.clone().into_datum(),
+                    field.into_datum(),
+                ]),
             )?,
             None => client.select(
                 SQL_HASH_GET,
                 None,
                 Some(vec![
+                    (PgBuiltInOids::INT2OID.oid(), db.into_datum()),
                     (PgBuiltInOids::TEXTOID.oid(), key.clone().into_datum()),
                     (PgBuiltInOids::TEXTOID.oid(), field.into_datum()),
                 ]),
@@ -180,21 +196,29 @@ pub fn cmd_hmget(
 pub fn cmd_hgetall(
     client: &SpiClient,
     plans: Option<&PreparedPlans>,
+    db: i16,
     args: &[Bytes],
 ) -> SpiResult<RespValue> {
     if args.len() != 2 {
         return Ok(RespValue::wrong_arity("hgetall"));
     }
     let key = as_str(&args[1]);
-    if keys::is_non_string_expired(client, &key)? {
+    if keys::is_non_string_expired(client, db, &key)? {
         return Ok(RespValue::Map(Vec::new()));
     }
     let table = match plans {
-        Some(p) => client.select(&p.hash_getall, None, Some(vec![key.into_datum()]))?,
+        Some(p) => client.select(
+            &p.hash_getall,
+            None,
+            Some(vec![db.into_datum(), key.into_datum()]),
+        )?,
         None => client.select(
             SQL_HASH_GETALL,
             None,
-            Some(vec![(PgBuiltInOids::TEXTOID.oid(), key.into_datum())]),
+            Some(vec![
+                (PgBuiltInOids::INT2OID.oid(), db.into_datum()),
+                (PgBuiltInOids::TEXTOID.oid(), key.into_datum()),
+            ]),
         )?,
     };
 
@@ -207,12 +231,12 @@ pub fn cmd_hgetall(
     Ok(RespValue::Map(pairs))
 }
 
-pub fn cmd_hdel(client: &mut SpiClient, args: &[Bytes]) -> SpiResult<RespValue> {
+pub fn cmd_hdel(client: &mut SpiClient, db: i16, args: &[Bytes]) -> SpiResult<RespValue> {
     if args.len() < 3 {
         return Ok(RespValue::wrong_arity("hdel"));
     }
     let key = as_str(&args[1]);
-    if keys::purge_if_expired_non_string(client, &key)? {
+    if keys::purge_if_expired_non_string(client, db, &key)? {
         return Ok(RespValue::Integer(0));
     }
     let mut deleted: i64 = 0;
@@ -220,9 +244,10 @@ pub fn cmd_hdel(client: &mut SpiClient, args: &[Bytes]) -> SpiResult<RespValue> 
     for raw_field in &args[2..] {
         let field = as_str(raw_field);
         let res = client.update(
-            "DELETE FROM pg_redis_hashes WHERE key = $1 AND field = $2",
+            "DELETE FROM pg_redis_hashes WHERE db = $1 AND key = $2 AND field = $3",
             None,
             Some(vec![
+                (PgBuiltInOids::INT2OID.oid(), db.into_datum()),
                 (PgBuiltInOids::TEXTOID.oid(), key.clone().into_datum()),
                 (PgBuiltInOids::TEXTOID.oid(), field.into_datum()),
             ]),
@@ -231,26 +256,27 @@ pub fn cmd_hdel(client: &mut SpiClient, args: &[Bytes]) -> SpiResult<RespValue> 
     }
 
     if deleted > 0 {
-        keys::cleanup_expiry_if_empty(client, "pg_redis_hashes", &key)?;
+        keys::cleanup_expiry_if_empty(client, "pg_redis_hashes", db, &key)?;
     }
 
     Ok(RespValue::Integer(deleted))
 }
 
-pub fn cmd_hexists(client: &SpiClient, args: &[Bytes]) -> SpiResult<RespValue> {
+pub fn cmd_hexists(client: &SpiClient, db: i16, args: &[Bytes]) -> SpiResult<RespValue> {
     if args.len() != 3 {
         return Ok(RespValue::wrong_arity("hexists"));
     }
     let key = as_str(&args[1]);
     let field = as_str(&args[2]);
-    if keys::is_non_string_expired(client, &key)? {
+    if keys::is_non_string_expired(client, db, &key)? {
         return Ok(RespValue::Integer(0));
     }
     let exists = client
         .select(
-            "SELECT EXISTS(SELECT 1 FROM pg_redis_hashes WHERE key = $1 AND field = $2)",
+            "SELECT EXISTS(SELECT 1 FROM pg_redis_hashes WHERE db = $1 AND key = $2 AND field = $3)",
             None,
             Some(vec![
+                (PgBuiltInOids::INT2OID.oid(), db.into_datum()),
                 (PgBuiltInOids::TEXTOID.oid(), key.into_datum()),
                 (PgBuiltInOids::TEXTOID.oid(), field.into_datum()),
             ]),
@@ -261,19 +287,22 @@ pub fn cmd_hexists(client: &SpiClient, args: &[Bytes]) -> SpiResult<RespValue> {
     Ok(RespValue::Integer(if exists { 1 } else { 0 }))
 }
 
-pub fn cmd_hlen(client: &SpiClient, args: &[Bytes]) -> SpiResult<RespValue> {
+pub fn cmd_hlen(client: &SpiClient, db: i16, args: &[Bytes]) -> SpiResult<RespValue> {
     if args.len() != 2 {
         return Ok(RespValue::wrong_arity("hlen"));
     }
     let key = as_str(&args[1]);
-    if keys::is_non_string_expired(client, &key)? {
+    if keys::is_non_string_expired(client, db, &key)? {
         return Ok(RespValue::Integer(0));
     }
     let count = client
         .select(
-            "SELECT COUNT(*)::BIGINT FROM pg_redis_hashes WHERE key = $1",
+            "SELECT COUNT(*)::BIGINT FROM pg_redis_hashes WHERE db = $1 AND key = $2",
             None,
-            Some(vec![(PgBuiltInOids::TEXTOID.oid(), key.into_datum())]),
+            Some(vec![
+                (PgBuiltInOids::INT2OID.oid(), db.into_datum()),
+                (PgBuiltInOids::TEXTOID.oid(), key.into_datum()),
+            ]),
         )?
         .first()
         .get_one::<i64>()?
@@ -281,40 +310,46 @@ pub fn cmd_hlen(client: &SpiClient, args: &[Bytes]) -> SpiResult<RespValue> {
     Ok(RespValue::Integer(count))
 }
 
-pub fn cmd_hkeys(client: &SpiClient, args: &[Bytes]) -> SpiResult<RespValue> {
+pub fn cmd_hkeys(client: &SpiClient, db: i16, args: &[Bytes]) -> SpiResult<RespValue> {
     if args.len() != 2 {
         return Ok(RespValue::wrong_arity("hkeys"));
     }
     let key = as_str(&args[1]);
-    if keys::is_non_string_expired(client, &key)? {
+    if keys::is_non_string_expired(client, db, &key)? {
         return Ok(RespValue::Array(Vec::new()));
     }
     let table = client.select(
-        "SELECT field FROM pg_redis_hashes WHERE key = $1 ORDER BY field ASC",
+        "SELECT field FROM pg_redis_hashes WHERE db = $1 AND key = $2 ORDER BY field ASC",
         None,
-        Some(vec![(PgBuiltInOids::TEXTOID.oid(), key.into_datum())]),
+        Some(vec![
+            (PgBuiltInOids::INT2OID.oid(), db.into_datum()),
+            (PgBuiltInOids::TEXTOID.oid(), key.into_datum()),
+        ]),
     )?;
-    let mut keys = Vec::with_capacity(table.len());
+    let mut keys_out = Vec::with_capacity(table.len());
     for row in table {
         if let Some(f) = row.get::<String>(1)? {
-            keys.push(RespValue::bulk(f));
+            keys_out.push(RespValue::bulk(f));
         }
     }
-    Ok(RespValue::Array(keys))
+    Ok(RespValue::Array(keys_out))
 }
 
-pub fn cmd_hvals(client: &SpiClient, args: &[Bytes]) -> SpiResult<RespValue> {
+pub fn cmd_hvals(client: &SpiClient, db: i16, args: &[Bytes]) -> SpiResult<RespValue> {
     if args.len() != 2 {
         return Ok(RespValue::wrong_arity("hvals"));
     }
     let key = as_str(&args[1]);
-    if keys::is_non_string_expired(client, &key)? {
+    if keys::is_non_string_expired(client, db, &key)? {
         return Ok(RespValue::Array(Vec::new()));
     }
     let table = client.select(
-        "SELECT value FROM pg_redis_hashes WHERE key = $1 ORDER BY field ASC",
+        "SELECT value FROM pg_redis_hashes WHERE db = $1 AND key = $2 ORDER BY field ASC",
         None,
-        Some(vec![(PgBuiltInOids::TEXTOID.oid(), key.into_datum())]),
+        Some(vec![
+            (PgBuiltInOids::INT2OID.oid(), db.into_datum()),
+            (PgBuiltInOids::TEXTOID.oid(), key.into_datum()),
+        ]),
     )?;
     let mut vals = Vec::with_capacity(table.len());
     for row in table {
@@ -328,6 +363,7 @@ pub fn cmd_hvals(client: &SpiClient, args: &[Bytes]) -> SpiResult<RespValue> {
 pub fn cmd_hincrby(
     client: &mut SpiClient,
     plans: Option<&PreparedPlans>,
+    db: i16,
     args: &[Bytes],
 ) -> SpiResult<RespValue> {
     if args.len() != 4 {
@@ -338,19 +374,24 @@ pub fn cmd_hincrby(
     let Some(delta) = parse_i64(&args[3]) else {
         return Ok(RespValue::not_integer_err());
     };
-    keys::purge_if_expired_non_string(client, &key)?;
+    keys::purge_if_expired_non_string(client, db, &key)?;
 
     let current = {
         let table = match plans {
             Some(p) => client.select(
                 &p.hash_get,
                 None,
-                Some(vec![key.clone().into_datum(), field.clone().into_datum()]),
+                Some(vec![
+                    db.into_datum(),
+                    key.clone().into_datum(),
+                    field.clone().into_datum(),
+                ]),
             )?,
             None => client.select(
                 SQL_HASH_GET,
                 None,
                 Some(vec![
+                    (PgBuiltInOids::INT2OID.oid(), db.into_datum()),
                     (PgBuiltInOids::TEXTOID.oid(), key.clone().into_datum()),
                     (PgBuiltInOids::TEXTOID.oid(), field.clone().into_datum()),
                 ]),
@@ -377,7 +418,12 @@ pub fn cmd_hincrby(
             client.update(
                 &p.hash_upsert,
                 None,
-                Some(vec![key.into_datum(), field.into_datum(), next_str.into_datum()]),
+                Some(vec![
+                    db.into_datum(),
+                    key.into_datum(),
+                    field.into_datum(),
+                    next_str.into_datum(),
+                ]),
             )?;
         }
         None => {
@@ -385,6 +431,7 @@ pub fn cmd_hincrby(
                 SQL_HASH_UPSERT,
                 None,
                 Some(vec![
+                    (PgBuiltInOids::INT2OID.oid(), db.into_datum()),
                     (PgBuiltInOids::TEXTOID.oid(), key.into_datum()),
                     (PgBuiltInOids::TEXTOID.oid(), field.into_datum()),
                     (PgBuiltInOids::TEXTOID.oid(), next_str.into_datum()),
@@ -399,6 +446,7 @@ pub fn cmd_hincrby(
 pub fn cmd_hincrbyfloat(
     client: &mut SpiClient,
     plans: Option<&PreparedPlans>,
+    db: i16,
     args: &[Bytes],
 ) -> SpiResult<RespValue> {
     if args.len() != 4 {
@@ -409,19 +457,24 @@ pub fn cmd_hincrbyfloat(
     let Some(delta) = parse_f64(&args[3]) else {
         return Ok(RespValue::not_float_err());
     };
-    keys::purge_if_expired_non_string(client, &key)?;
+    keys::purge_if_expired_non_string(client, db, &key)?;
 
     let current = {
         let table = match plans {
             Some(p) => client.select(
                 &p.hash_get,
                 None,
-                Some(vec![key.clone().into_datum(), field.clone().into_datum()]),
+                Some(vec![
+                    db.into_datum(),
+                    key.clone().into_datum(),
+                    field.clone().into_datum(),
+                ]),
             )?,
             None => client.select(
                 SQL_HASH_GET,
                 None,
                 Some(vec![
+                    (PgBuiltInOids::INT2OID.oid(), db.into_datum()),
                     (PgBuiltInOids::TEXTOID.oid(), key.clone().into_datum()),
                     (PgBuiltInOids::TEXTOID.oid(), field.clone().into_datum()),
                 ]),
@@ -452,6 +505,7 @@ pub fn cmd_hincrbyfloat(
                 &p.hash_upsert,
                 None,
                 Some(vec![
+                    db.into_datum(),
                     key.into_datum(),
                     field.into_datum(),
                     formatted.clone().into_datum(),
@@ -463,6 +517,7 @@ pub fn cmd_hincrbyfloat(
                 SQL_HASH_UPSERT,
                 None,
                 Some(vec![
+                    (PgBuiltInOids::INT2OID.oid(), db.into_datum()),
                     (PgBuiltInOids::TEXTOID.oid(), key.into_datum()),
                     (PgBuiltInOids::TEXTOID.oid(), field.into_datum()),
                     (PgBuiltInOids::TEXTOID.oid(), formatted.clone().into_datum()),
@@ -475,7 +530,7 @@ pub fn cmd_hincrbyfloat(
 }
 
 /// `HSCAN key cursor [MATCH pattern] [COUNT count] [NOVALUES]`
-pub fn cmd_hscan(client: &SpiClient, args: &[Bytes]) -> SpiResult<RespValue> {
+pub fn cmd_hscan(client: &SpiClient, db: i16, args: &[Bytes]) -> SpiResult<RespValue> {
     if args.len() < 3 {
         return Ok(RespValue::wrong_arity("hscan"));
     }
@@ -523,7 +578,7 @@ pub fn cmd_hscan(client: &SpiClient, args: &[Bytes]) -> SpiResult<RespValue> {
         }
     }
 
-    if keys::is_non_string_expired(client, &key)? {
+    if keys::is_non_string_expired(client, db, &key)? {
         return Ok(RespValue::Array(vec![
             RespValue::bulk("0"),
             RespValue::Array(Vec::new()),
@@ -531,9 +586,12 @@ pub fn cmd_hscan(client: &SpiClient, args: &[Bytes]) -> SpiResult<RespValue> {
     }
 
     let table = client.select(
-        "SELECT field, value FROM pg_redis_hashes WHERE key = $1 ORDER BY field ASC",
+        "SELECT field, value FROM pg_redis_hashes WHERE db = $1 AND key = $2 ORDER BY field ASC",
         None,
-        Some(vec![(PgBuiltInOids::TEXTOID.oid(), key.into_datum())]),
+        Some(vec![
+            (PgBuiltInOids::INT2OID.oid(), db.into_datum()),
+            (PgBuiltInOids::TEXTOID.oid(), key.into_datum()),
+        ]),
     )?;
 
     let mut entries: Vec<(String, String)> = Vec::with_capacity(table.len());

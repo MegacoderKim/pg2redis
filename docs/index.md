@@ -12,6 +12,7 @@ hide:
   <span class="hero-badge">RESP2 &amp; RESP3</span>
   <span class="hero-badge">Pub/Sub (Named &amp; Pattern)</span>
   <span class="hero-badge">Sandboxed Lua 5.1</span>
+  <span class="hero-badge">16 Logical DBs (SELECT)</span>
   <span class="hero-badge">Optional TLS &amp; mTLS</span>
   <span class="hero-badge">AUTH &amp; Universal TTL</span>
   <span class="hero-badge">BullMQ 5.13 Ready</span>

@@ -28,13 +28,13 @@
 
 | Table | Purpose | Primary Key |
 | --- | --- | --- |
-| `pg_redis_strings` | `GET`, `GETEX`, `SET`, `INCR`, `DECR`, `EXPIRE`, `TTL`, `DEL` | `(key)` |
-| `pg_redis_hashes` | `HSET`, `HGET`, `HMGET`, `HGETALL`, `HDEL`, `HINCRBY`, `HSCAN` | `(key, field)` |
-| `pg_redis_lists` | `LPUSH`, `RPUSH`, `LPOP`, `RPOP`, `LRANGE`, `LLEN`, `LINDEX`, `LSET`, `LREM`, `LTRIM`, `LPOS`, `LMOVE` | `(key, seq)` |
-| `pg_redis_zsets` | `ZADD`, `ZRANGE`, `ZRANGEBYSCORE`, `ZREM`, `ZPOPMIN`, `BZPOPMIN`, `ZSCORE`, `ZRANK`, `ZSCAN` | `(key, member)` |
-| `pg_redis_sets` | `SADD`, `SREM`, `SMEMBERS`, `SISMEMBER`, `SCARD`, `SPOP`, `SSCAN` | `(key, member)` |
-| `pg_redis_streams` | `XADD`, `XTRIM`, `XREAD [BLOCK]`, `XRANGE`, `XREVRANGE`, `XLEN`, `XDEL` | `(key, ms, seq)` |
-| `pg_redis_key_expiry` | Universal TTL expiration (`EXPIRE`/`PEXPIRE`/`TTL`/`PERSIST`) for non-string keys | `(key)` |
+| `pg_redis_strings` | `GET`, `GETEX`, `SET`, `INCR`, `DECR`, `EXPIRE`, `TTL`, `DEL` | `(db, key)` |
+| `pg_redis_hashes` | `HSET`, `HGET`, `HMGET`, `HGETALL`, `HDEL`, `HINCRBY`, `HSCAN` | `(db, key, field)` |
+| `pg_redis_lists` | `LPUSH`, `RPUSH`, `LPOP`, `RPOP`, `LRANGE`, `LLEN`, `LINDEX`, `LSET`, `LREM`, `LTRIM`, `LPOS`, `LMOVE` | `(db, key, seq)` |
+| `pg_redis_zsets` | `ZADD`, `ZRANGE`, `ZRANGEBYSCORE`, `ZREM`, `ZPOPMIN`, `BZPOPMIN`, `ZSCORE`, `ZRANK`, `ZSCAN` | `(db, key, member)` |
+| `pg_redis_sets` | `SADD`, `SREM`, `SMEMBERS`, `SISMEMBER`, `SCARD`, `SPOP`, `SSCAN` | `(db, key, member)` |
+| `pg_redis_streams` | `XADD`, `XTRIM`, `XREAD [BLOCK]`, `XRANGE`, `XREVRANGE`, `XLEN`, `XDEL` | `(db, key, ms, seq)` |
+| `pg_redis_key_expiry` | Universal TTL expiration (`EXPIRE`/`PEXPIRE`/`TTL`/`PERSIST`) for non-string keys | `(db, key)` |
 
 ## Quick Start (Docker & Prebuilt Images)
 
@@ -86,6 +86,7 @@ Runs raw TCP RESP tests, Python (`FastAPI` + `redis-py` + `psycopg`), Go (`go-re
 | `pg_redis.tls_ca_cert_file` | *(unset)* | Optional PEM CA bundle path for mTLS client cert verification (`SUPERUSER_ONLY`) |
 | `pg_redis.tls_auth_clients` | `no` | mTLS client certificate policy: `no`, `optional`, or `yes` (`SUPERUSER_ONLY`) |
 | `pg_redis.database` | `postgres` | PostgreSQL database used by the background worker |
+| `pg_redis.databases` | `16` | Number of logical Redis databases available via `SELECT` (`0`..`N-1`) |
 | `pg_redis.unlogged` | `off` | Create auto-provisioned catalog tables as `UNLOGGED` |
 | `pg_redis.cache_enabled` | `on` | Toggle in-process `moka` L1 hot-key cache |
 | `pg_redis.cache_capacity` | `10000` | Maximum L1 cache entries |

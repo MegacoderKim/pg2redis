@@ -52,14 +52,22 @@ pub fn get_from_db(
     client: &SpiClient,
     plans: Option<&PreparedPlans>,
     cache: Option<&L1Cache>,
+    db: i16,
     key: &str,
 ) -> SpiResult<Option<Bytes>> {
     let table = match plans {
-        Some(p) => client.select(&p.string_get, None, Some(vec![key.into_datum()]))?,
+        Some(p) => client.select(
+            &p.string_get,
+            None,
+            Some(vec![db.into_datum(), key.into_datum()]),
+        )?,
         None => client.select(
             SQL_STRING_GET,
             None,
-            Some(vec![(PgBuiltInOids::TEXTOID.oid(), key.into_datum())]),
+            Some(vec![
+                (PgBuiltInOids::INT2OID.oid(), db.into_datum()),
+                (PgBuiltInOids::TEXTOID.oid(), key.into_datum()),
+            ]),
         )?,
     };
 
@@ -82,7 +90,7 @@ pub fn get_from_db(
                         None
                     }
                 });
-                c.insert(key.to_string(), bytes.clone(), rem);
+                c.insert(db, key.to_string(), bytes.clone(), rem);
             }
             Ok(Some(bytes))
         }
@@ -94,6 +102,7 @@ pub fn cmd_get(
     client: &SpiClient,
     plans: Option<&PreparedPlans>,
     cache: Option<&L1Cache>,
+    db: i16,
     args: &[Bytes],
 ) -> SpiResult<RespValue> {
     if args.len() != 2 {
@@ -101,11 +110,11 @@ pub fn cmd_get(
     }
     let key = as_str(&args[1]);
     if let Some(c) = cache {
-        if let Some(val) = c.get(&key) {
+        if let Some(val) = c.get(db, &key) {
             return Ok(RespValue::BulkString(val));
         }
     }
-    match get_from_db(client, plans, cache, &key)? {
+    match get_from_db(client, plans, cache, db, &key)? {
         Some(b) => Ok(RespValue::BulkString(b)),
         None => Ok(RespValue::Null),
     }
@@ -115,6 +124,7 @@ pub fn cmd_set(
     client: &mut SpiClient,
     plans: Option<&PreparedPlans>,
     cache: Option<&L1Cache>,
+    db: i16,
     args: &[Bytes],
 ) -> SpiResult<RespValue> {
     if args.len() < 3 {
@@ -223,7 +233,7 @@ pub fn cmd_set(
     }
 
     let existing = if return_old || cond != SetCondition::Always {
-        get_from_db(client, plans, None, &key)?
+        get_from_db(client, plans, None, db, &key)?
     } else {
         None
     };
@@ -244,12 +254,15 @@ pub fn cmd_set(
     if let SetExpiry::Millis(ms) = expiry {
         if ms <= 0 {
             client.update(
-                "DELETE FROM pg_redis_strings WHERE key = $1",
+                "DELETE FROM pg_redis_strings WHERE db = $1 AND key = $2",
                 None,
-                Some(vec![(PgBuiltInOids::TEXTOID.oid(), key.clone().into_datum())]),
+                Some(vec![
+                    (PgBuiltInOids::INT2OID.oid(), db.into_datum()),
+                    (PgBuiltInOids::TEXTOID.oid(), key.clone().into_datum()),
+                ]),
             )?;
             if let Some(c) = cache {
-                c.invalidate(&key);
+                c.invalidate(db, &key);
             }
             return Ok(if return_old {
                 existing.map(RespValue::BulkString).unwrap_or(RespValue::Null)
@@ -259,7 +272,7 @@ pub fn cmd_set(
         }
     }
 
-    write_string(client, plans, cache, &key, &value, expiry)?;
+    write_string(client, plans, cache, db, &key, &value, expiry)?;
 
     if return_old {
         Ok(existing.map(RespValue::BulkString).unwrap_or(RespValue::Null))
@@ -272,6 +285,7 @@ fn write_string(
     client: &mut SpiClient,
     plans: Option<&PreparedPlans>,
     cache: Option<&L1Cache>,
+    db: i16,
     key: &str,
     value: &Bytes,
     expiry: SetExpiry,
@@ -284,7 +298,7 @@ fn write_string(
                     client.update(
                         &p.string_set_no_ttl,
                         None,
-                        Some(vec![key.into_datum(), val_slice.into_datum()]),
+                        Some(vec![db.into_datum(), key.into_datum(), val_slice.into_datum()]),
                     )?;
                 }
                 None => {
@@ -292,6 +306,7 @@ fn write_string(
                         SQL_STRING_SET_NO_TTL,
                         None,
                         Some(vec![
+                            (PgBuiltInOids::INT2OID.oid(), db.into_datum()),
                             (PgBuiltInOids::TEXTOID.oid(), key.into_datum()),
                             (PgBuiltInOids::BYTEAOID.oid(), val_slice.into_datum()),
                         ]),
@@ -299,7 +314,7 @@ fn write_string(
                 }
             }
             if let Some(c) = cache {
-                c.insert(key.to_string(), value.clone(), None);
+                c.insert(db, key.to_string(), value.clone(), None);
             }
         }
         SetExpiry::Millis(ms) => {
@@ -308,7 +323,12 @@ fn write_string(
                     client.update(
                         &p.string_set_with_ms,
                         None,
-                        Some(vec![key.into_datum(), val_slice.into_datum(), ms.into_datum()]),
+                        Some(vec![
+                            db.into_datum(),
+                            key.into_datum(),
+                            val_slice.into_datum(),
+                            ms.into_datum(),
+                        ]),
                     )?;
                 }
                 None => {
@@ -316,6 +336,7 @@ fn write_string(
                         SQL_STRING_SET_WITH_MS,
                         None,
                         Some(vec![
+                            (PgBuiltInOids::INT2OID.oid(), db.into_datum()),
                             (PgBuiltInOids::TEXTOID.oid(), key.into_datum()),
                             (PgBuiltInOids::BYTEAOID.oid(), val_slice.into_datum()),
                             (PgBuiltInOids::INT8OID.oid(), ms.into_datum()),
@@ -325,6 +346,7 @@ fn write_string(
             }
             if let Some(c) = cache {
                 c.insert(
+                    db,
                     key.to_string(),
                     value.clone(),
                     Some(Duration::from_millis(ms as u64)),
@@ -337,7 +359,7 @@ fn write_string(
                     client.update(
                         &p.string_set_keep_ttl,
                         None,
-                        Some(vec![key.into_datum(), val_slice.into_datum()]),
+                        Some(vec![db.into_datum(), key.into_datum(), val_slice.into_datum()]),
                     )?;
                 }
                 None => {
@@ -345,6 +367,7 @@ fn write_string(
                         SQL_STRING_SET_KEEP_TTL,
                         None,
                         Some(vec![
+                            (PgBuiltInOids::INT2OID.oid(), db.into_datum()),
                             (PgBuiltInOids::TEXTOID.oid(), key.into_datum()),
                             (PgBuiltInOids::BYTEAOID.oid(), val_slice.into_datum()),
                         ]),
@@ -352,7 +375,7 @@ fn write_string(
                 }
             }
             if let Some(c) = cache {
-                c.invalidate(key);
+                c.invalidate(db, key);
             }
         }
     }
@@ -363,6 +386,7 @@ pub fn cmd_setex(
     client: &mut SpiClient,
     plans: Option<&PreparedPlans>,
     cache: Option<&L1Cache>,
+    db: i16,
     args: &[Bytes],
     millis: bool,
 ) -> SpiResult<RespValue> {
@@ -391,7 +415,7 @@ pub fn cmd_setex(
             }
         }
     };
-    write_string(client, plans, cache, &key, &args[3], SetExpiry::Millis(ms))?;
+    write_string(client, plans, cache, db, &key, &args[3], SetExpiry::Millis(ms))?;
     Ok(RespValue::ok())
 }
 
@@ -399,16 +423,17 @@ pub fn cmd_setnx(
     client: &mut SpiClient,
     plans: Option<&PreparedPlans>,
     cache: Option<&L1Cache>,
+    db: i16,
     args: &[Bytes],
 ) -> SpiResult<RespValue> {
     if args.len() != 3 {
         return Ok(RespValue::wrong_arity("setnx"));
     }
     let key = as_str(&args[1]);
-    if get_from_db(client, plans, None, &key)?.is_some() {
+    if get_from_db(client, plans, None, db, &key)?.is_some() {
         return Ok(RespValue::Integer(0));
     }
-    write_string(client, plans, cache, &key, &args[2], SetExpiry::None)?;
+    write_string(client, plans, cache, db, &key, &args[2], SetExpiry::None)?;
     Ok(RespValue::Integer(1))
 }
 
@@ -416,14 +441,15 @@ pub fn cmd_getset(
     client: &mut SpiClient,
     plans: Option<&PreparedPlans>,
     cache: Option<&L1Cache>,
+    db: i16,
     args: &[Bytes],
 ) -> SpiResult<RespValue> {
     if args.len() != 3 {
         return Ok(RespValue::wrong_arity("getset"));
     }
     let key = as_str(&args[1]);
-    let old = get_from_db(client, plans, None, &key)?;
-    write_string(client, plans, cache, &key, &args[2], SetExpiry::None)?;
+    let old = get_from_db(client, plans, None, db, &key)?;
+    write_string(client, plans, cache, db, &key, &args[2], SetExpiry::None)?;
     Ok(old.map(RespValue::BulkString).unwrap_or(RespValue::Null))
 }
 
@@ -431,22 +457,26 @@ pub fn cmd_getdel(
     client: &mut SpiClient,
     plans: Option<&PreparedPlans>,
     cache: Option<&L1Cache>,
+    db: i16,
     args: &[Bytes],
 ) -> SpiResult<RespValue> {
     if args.len() != 2 {
         return Ok(RespValue::wrong_arity("getdel"));
     }
     let key = as_str(&args[1]);
-    let old = get_from_db(client, plans, None, &key)?;
+    let old = get_from_db(client, plans, None, db, &key)?;
     if old.is_some() {
         client.update(
-            "DELETE FROM pg_redis_strings WHERE key = $1",
+            "DELETE FROM pg_redis_strings WHERE db = $1 AND key = $2",
             None,
-            Some(vec![(PgBuiltInOids::TEXTOID.oid(), key.clone().into_datum())]),
+            Some(vec![
+                (PgBuiltInOids::INT2OID.oid(), db.into_datum()),
+                (PgBuiltInOids::TEXTOID.oid(), key.clone().into_datum()),
+            ]),
         )?;
     }
     if let Some(c) = cache {
-        c.invalidate(&key);
+        c.invalidate(db, &key);
     }
     Ok(old.map(RespValue::BulkString).unwrap_or(RespValue::Null))
 }
@@ -456,6 +486,7 @@ pub fn cmd_getex(
     client: &mut SpiClient,
     plans: Option<&PreparedPlans>,
     cache: Option<&L1Cache>,
+    db: i16,
     args: &[Bytes],
 ) -> SpiResult<RespValue> {
     if args.len() < 2 {
@@ -547,7 +578,7 @@ pub fn cmd_getex(
         }
     }
 
-    let Some(val) = get_from_db(client, plans, None, &key)? else {
+    let Some(val) = get_from_db(client, plans, None, db, &key)? else {
         return Ok(RespValue::Null);
     };
 
@@ -555,37 +586,44 @@ pub fn cmd_getex(
         GetExAction::None => {}
         GetExAction::Persist => {
             client.update(
-                "UPDATE pg_redis_strings SET expires_at = NULL WHERE key = $1",
+                "UPDATE pg_redis_strings SET expires_at = NULL WHERE db = $1 AND key = $2",
                 None,
-                Some(vec![(PgBuiltInOids::TEXTOID.oid(), key.clone().into_datum())]),
+                Some(vec![
+                    (PgBuiltInOids::INT2OID.oid(), db.into_datum()),
+                    (PgBuiltInOids::TEXTOID.oid(), key.clone().into_datum()),
+                ]),
             )?;
             if let Some(c) = cache {
-                c.insert(key, val.clone(), None);
+                c.insert(db, key, val.clone(), None);
             }
         }
         GetExAction::Millis(ms) => {
             if ms <= 0 {
                 client.update(
-                    "DELETE FROM pg_redis_strings WHERE key = $1",
+                    "DELETE FROM pg_redis_strings WHERE db = $1 AND key = $2",
                     None,
-                    Some(vec![(PgBuiltInOids::TEXTOID.oid(), key.clone().into_datum())]),
+                    Some(vec![
+                        (PgBuiltInOids::INT2OID.oid(), db.into_datum()),
+                        (PgBuiltInOids::TEXTOID.oid(), key.clone().into_datum()),
+                    ]),
                 )?;
                 if let Some(c) = cache {
-                    c.invalidate(&key);
+                    c.invalidate(db, &key);
                 }
             } else {
                 client.update(
                     "UPDATE pg_redis_strings \
-                     SET expires_at = NOW() + ($2 * INTERVAL '1 millisecond') \
-                     WHERE key = $1",
+                     SET expires_at = NOW() + ($3 * INTERVAL '1 millisecond') \
+                     WHERE db = $1 AND key = $2",
                     None,
                     Some(vec![
+                        (PgBuiltInOids::INT2OID.oid(), db.into_datum()),
                         (PgBuiltInOids::TEXTOID.oid(), key.clone().into_datum()),
                         (PgBuiltInOids::INT8OID.oid(), ms.into_datum()),
                     ]),
                 )?;
                 if let Some(c) = cache {
-                    c.insert(key, val.clone(), Some(Duration::from_millis(ms as u64)));
+                    c.insert(db, key, val.clone(), Some(Duration::from_millis(ms as u64)));
                 }
             }
         }
@@ -598,6 +636,7 @@ pub fn cmd_mget(
     client: &SpiClient,
     plans: Option<&PreparedPlans>,
     cache: Option<&L1Cache>,
+    db: i16,
     args: &[Bytes],
 ) -> SpiResult<RespValue> {
     if args.len() < 2 {
@@ -607,12 +646,12 @@ pub fn cmd_mget(
     for arg in &args[1..] {
         let key = as_str(arg);
         if let Some(c) = cache {
-            if let Some(val) = c.get(&key) {
+            if let Some(val) = c.get(db, &key) {
                 results.push(RespValue::BulkString(val));
                 continue;
             }
         }
-        match get_from_db(client, plans, cache, &key)? {
+        match get_from_db(client, plans, cache, db, &key)? {
             Some(b) => results.push(RespValue::BulkString(b)),
             None => results.push(RespValue::Null),
         }
@@ -624,6 +663,7 @@ pub fn cmd_mset(
     client: &mut SpiClient,
     plans: Option<&PreparedPlans>,
     cache: Option<&L1Cache>,
+    db: i16,
     args: &[Bytes],
 ) -> SpiResult<RespValue> {
     if args.len() < 3 || (args.len() - 1) % 2 != 0 {
@@ -631,7 +671,7 @@ pub fn cmd_mset(
     }
     for pair in args[1..].chunks_exact(2) {
         let key = as_str(&pair[0]);
-        write_string(client, plans, cache, &key, &pair[1], SetExpiry::None)?;
+        write_string(client, plans, cache, db, &key, &pair[1], SetExpiry::None)?;
     }
     Ok(RespValue::ok())
 }
@@ -640,6 +680,7 @@ pub fn cmd_incrby(
     client: &mut SpiClient,
     plans: Option<&PreparedPlans>,
     cache: Option<&L1Cache>,
+    db: i16,
     args: &[Bytes],
     delta_override: Option<i64>,
     negate: bool,
@@ -669,7 +710,7 @@ pub fn cmd_incrby(
     }
 
     let key = as_str(&args[1]);
-    let current = match get_from_db(client, plans, None, &key)? {
+    let current = match get_from_db(client, plans, None, db, &key)? {
         Some(raw) => match parse_i64(&raw) {
             Some(n) => n,
             None => return Ok(RespValue::not_integer_err()),
@@ -682,7 +723,7 @@ pub fn cmd_incrby(
     };
 
     let next_bytes = Bytes::from(next.to_string());
-    write_string(client, plans, cache, &key, &next_bytes, SetExpiry::KeepTtl)?;
+    write_string(client, plans, cache, db, &key, &next_bytes, SetExpiry::KeepTtl)?;
     Ok(RespValue::Integer(next))
 }
 
@@ -690,6 +731,7 @@ pub fn cmd_incrbyfloat(
     client: &mut SpiClient,
     plans: Option<&PreparedPlans>,
     cache: Option<&L1Cache>,
+    db: i16,
     args: &[Bytes],
 ) -> SpiResult<RespValue> {
     if args.len() != 3 {
@@ -699,7 +741,7 @@ pub fn cmd_incrbyfloat(
         return Ok(RespValue::not_float_err());
     };
     let key = as_str(&args[1]);
-    let current = match get_from_db(client, plans, None, &key)? {
+    let current = match get_from_db(client, plans, None, db, &key)? {
         Some(raw) => match parse_f64(&raw) {
             Some(v) => v,
             None => return Ok(RespValue::not_float_err()),
@@ -714,7 +756,7 @@ pub fn cmd_incrbyfloat(
     }
     let formatted = format_score(next);
     let next_bytes = Bytes::from(formatted);
-    write_string(client, plans, cache, &key, &next_bytes, SetExpiry::KeepTtl)?;
+    write_string(client, plans, cache, db, &key, &next_bytes, SetExpiry::KeepTtl)?;
     Ok(RespValue::BulkString(next_bytes))
 }
 
@@ -722,13 +764,14 @@ pub fn cmd_append(
     client: &mut SpiClient,
     plans: Option<&PreparedPlans>,
     cache: Option<&L1Cache>,
+    db: i16,
     args: &[Bytes],
 ) -> SpiResult<RespValue> {
     if args.len() != 3 {
         return Ok(RespValue::wrong_arity("append"));
     }
     let key = as_str(&args[1]);
-    let mut combined = match get_from_db(client, plans, None, &key)? {
+    let mut combined = match get_from_db(client, plans, None, db, &key)? {
         Some(existing) => existing.to_vec(),
         None => Vec::new(),
     };
@@ -738,6 +781,7 @@ pub fn cmd_append(
         client,
         plans,
         cache,
+        db,
         &key,
         &Bytes::from(combined),
         SetExpiry::KeepTtl,
@@ -749,6 +793,7 @@ pub fn cmd_strlen(
     client: &SpiClient,
     plans: Option<&PreparedPlans>,
     cache: Option<&L1Cache>,
+    db: i16,
     args: &[Bytes],
 ) -> SpiResult<RespValue> {
     if args.len() != 2 {
@@ -756,11 +801,11 @@ pub fn cmd_strlen(
     }
     let key = as_str(&args[1]);
     if let Some(c) = cache {
-        if let Some(val) = c.get(&key) {
+        if let Some(val) = c.get(db, &key) {
             return Ok(RespValue::Integer(val.len() as i64));
         }
     }
-    let len = get_from_db(client, plans, cache, &key)?
+    let len = get_from_db(client, plans, cache, db, &key)?
         .map(|b| b.len() as i64)
         .unwrap_or(0);
     Ok(RespValue::Integer(len))

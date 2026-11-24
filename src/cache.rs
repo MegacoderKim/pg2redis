@@ -20,13 +20,13 @@ pub struct CacheStats {
     pub entry_count: u64,
 }
 
-/// In-process L1 hot-key cache backed by `moka::sync::Cache`.
+/// In-process L1 hot-key cache backed by `moka::sync::Cache`, scoped per `(db, key)`.
 ///
 /// Supports write-through updates/invalidation from the background worker and
 /// tracks both the Redis key's own TTL (`key_expires_at`) and a bounded L1
 /// revalidation deadline (`cache_expires_at`).
 pub struct L1Cache {
-    inner: Cache<String, CachedString>,
+    inner: Cache<(i16, String), CachedString>,
     hits: AtomicU64,
     misses: AtomicU64,
     invalidations: AtomicU64,
@@ -42,22 +42,23 @@ impl L1Cache {
         }
     }
 
-    pub fn get(&self, key: &str) -> Option<Bytes> {
+    pub fn get(&self, db: i16, key: &str) -> Option<Bytes> {
         if !config::cache_enabled() {
             return None;
         }
 
+        let cache_key = (db, key.to_string());
         let now = Instant::now();
-        if let Some(entry) = self.inner.get(key) {
+        if let Some(entry) = self.inner.get(&cache_key) {
             if let Some(key_exp) = entry.key_expires_at {
                 if now >= key_exp {
-                    self.inner.invalidate(key);
+                    self.inner.invalidate(&cache_key);
                     self.misses.fetch_add(1, Ordering::Relaxed);
                     return None;
                 }
             }
             if now >= entry.cache_expires_at {
-                self.inner.invalidate(key);
+                self.inner.invalidate(&cache_key);
                 self.misses.fetch_add(1, Ordering::Relaxed);
                 return None;
             }
@@ -69,15 +70,16 @@ impl L1Cache {
         None
     }
 
-    pub fn insert(&self, key: String, value: Bytes, remaining_ttl: Option<Duration>) {
+    pub fn insert(&self, db: i16, key: String, value: Bytes, remaining_ttl: Option<Duration>) {
         if !config::cache_enabled() {
             return;
         }
 
+        let cache_key = (db, key);
         let now = Instant::now();
         let key_expires_at = match remaining_ttl {
             Some(d) if d.is_zero() => {
-                self.inner.invalidate(&key);
+                self.inner.invalidate(&cache_key);
                 return;
             }
             Some(d) => Some(now + d),
@@ -91,7 +93,7 @@ impl L1Cache {
         };
 
         self.inner.insert(
-            key,
+            cache_key,
             CachedString {
                 value,
                 key_expires_at,
@@ -100,8 +102,9 @@ impl L1Cache {
         );
     }
 
-    pub fn invalidate(&self, key: &str) {
-        self.inner.invalidate(key);
+    pub fn invalidate(&self, db: i16, key: &str) {
+        let cache_key = (db, key.to_string());
+        self.inner.invalidate(&cache_key);
         self.invalidations.fetch_add(1, Ordering::Relaxed);
     }
 
