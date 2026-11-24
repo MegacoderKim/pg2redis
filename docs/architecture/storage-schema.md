@@ -9,9 +9,11 @@ Every table is created with `WITH (fillfactor = 80)` to reserve 20% free space p
 ```sql
 -- 1. Strings (GET, SET, INCR, DECR, APPEND, EXPIRE, TTL, DEL)
 CREATE TABLE IF NOT EXISTS pg_redis_strings (
-    key TEXT PRIMARY KEY,
+    db SMALLINT NOT NULL DEFAULT 0,
+    key TEXT,
     value BYTEA,
-    expires_at TIMESTAMPTZ
+    expires_at TIMESTAMPTZ,
+    PRIMARY KEY (db, key)
 ) WITH (fillfactor = 80);
 
 CREATE INDEX IF NOT EXISTS idx_redis_strings_expiry
@@ -20,63 +22,70 @@ WHERE expires_at IS NOT NULL;
 
 -- 2. Hashes (HSET, HGET, HMGET, HGETALL, HDEL, HINCRBY)
 CREATE TABLE IF NOT EXISTS pg_redis_hashes (
+    db SMALLINT NOT NULL DEFAULT 0,
     key TEXT,
     field TEXT,
     value TEXT,
-    PRIMARY KEY (key, field)
+    PRIMARY KEY (db, key, field)
 ) WITH (fillfactor = 80);
 
 CREATE INDEX IF NOT EXISTS idx_redis_hashes_key
-ON pg_redis_hashes(key);
+ON pg_redis_hashes(db, key);
 
 -- 3. Lists (LPUSH, RPUSH, LPOP, RPOP, LRANGE, LLEN, LINDEX, LSET, LREM)
 CREATE TABLE IF NOT EXISTS pg_redis_lists (
+    db SMALLINT NOT NULL DEFAULT 0,
     key TEXT,
     seq BIGSERIAL,
     value TEXT,
-    PRIMARY KEY (key, seq)
+    PRIMARY KEY (db, key, seq)
 ) WITH (fillfactor = 80);
 
 CREATE INDEX IF NOT EXISTS idx_redis_lists_key_seq
-ON pg_redis_lists(key, seq);
+ON pg_redis_lists(db, key, seq);
 
 -- 4. Sorted Sets (ZADD, ZRANGE, ZREVRANGE, ZRANGEBYSCORE, ZREM, ZSCORE, ZRANK, ZPOPMIN, BZPOPMIN)
 CREATE TABLE IF NOT EXISTS pg_redis_zsets (
+    db SMALLINT NOT NULL DEFAULT 0,
     key TEXT,
     member TEXT,
     score DOUBLE PRECISION,
-    PRIMARY KEY (key, member)
+    PRIMARY KEY (db, key, member)
 ) WITH (fillfactor = 80);
 
 CREATE INDEX IF NOT EXISTS idx_redis_zsets_score
-ON pg_redis_zsets(key, score);
+ON pg_redis_zsets(db, key, score);
 
 -- 5. Sets (SADD, SREM, SMEMBERS, SISMEMBER, SCARD, SPOP)
 CREATE TABLE IF NOT EXISTS pg_redis_sets (
+    db SMALLINT NOT NULL DEFAULT 0,
     key TEXT,
     member TEXT,
-    PRIMARY KEY (key, member)
+    PRIMARY KEY (db, key, member)
 ) WITH (fillfactor = 80);
 
 CREATE INDEX IF NOT EXISTS idx_redis_sets_key
-ON pg_redis_sets(key);
+ON pg_redis_sets(db, key);
 
 -- 6. Streams (XADD, XTRIM, XREAD, XRANGE, XREVRANGE, XLEN, XDEL)
 CREATE TABLE IF NOT EXISTS pg_redis_streams (
+    db SMALLINT NOT NULL DEFAULT 0,
     key TEXT,
     ms BIGINT,
     seq BIGINT,
     fields TEXT,
-    PRIMARY KEY (key, ms, seq)
+    PRIMARY KEY (db, key, ms, seq)
 ) WITH (fillfactor = 80);
 
 CREATE INDEX IF NOT EXISTS idx_redis_streams_key_id
-ON pg_redis_streams(key, ms, seq);
+ON pg_redis_streams(db, key, ms, seq);
 
 -- 7. Universal Key Expiry (Hashes, Lists, ZSets, Sets, Streams)
 CREATE TABLE IF NOT EXISTS pg_redis_key_expiry (
-    key TEXT PRIMARY KEY,
-    expires_at TIMESTAMPTZ NOT NULL
+    db SMALLINT NOT NULL DEFAULT 0,
+    key TEXT,
+    expires_at TIMESTAMPTZ NOT NULL,
+    PRIMARY KEY (db, key)
 ) WITH (fillfactor = 80);
 
 CREATE INDEX IF NOT EXISTS idx_redis_key_expiry_at
@@ -131,3 +140,4 @@ Schema evolutions are packaged as standard PostgreSQL extension migration files 
 - `sql/pg_redis_core--0.3.0--0.4.0.sql` — adds `pg_redis_key_expiry` and `idx_redis_key_expiry_at`.
 - `sql/pg_redis_core--0.4.0--0.4.1.sql` — patch release upgrade marker.
 - `sql/pg_redis_core--0.4.1--0.5.0.sql` — optional native TLS (`rediss://`) & mTLS upgrade marker.
+- `sql/pg_redis_core--0.5.0--0.6.0.sql` — adds `db SMALLINT NOT NULL DEFAULT 0` and `(db, ...)` composite primary keys/indexes across all 7 tables for multi-database (`SELECT 0..N-1`) support.

@@ -74,11 +74,14 @@ fn parse_range_bound(s: &str, is_end: bool) -> Option<(i64, i64, bool)> {
     }
 }
 
-fn get_last_stream_id(client: &SpiClient, key: &str) -> SpiResult<Option<(i64, i64)>> {
+fn get_last_stream_id(client: &SpiClient, db: i16, key: &str) -> SpiResult<Option<(i64, i64)>> {
     let table = client.select(
-        "SELECT ms, seq FROM pg_redis_streams WHERE key = $1 ORDER BY ms DESC, seq DESC LIMIT 1",
+        "SELECT ms, seq FROM pg_redis_streams WHERE db = $1 AND key = $2 ORDER BY ms DESC, seq DESC LIMIT 1",
         None,
-        Some(vec![(PgBuiltInOids::TEXTOID.oid(), key.into_datum())]),
+        Some(vec![
+            (PgBuiltInOids::INT2OID.oid(), db.into_datum()),
+            (PgBuiltInOids::TEXTOID.oid(), key.into_datum()),
+        ]),
     )?;
     if table.is_empty() {
         return Ok(None);
@@ -109,6 +112,7 @@ fn decode_entry_fields(json_str: &str) -> Vec<RespValue> {
 
 fn apply_trim(
     client: &mut SpiClient,
+    db: i16,
     key: &str,
     strategy: StreamTrimStrategy,
 ) -> SpiResult<i64> {
@@ -117,15 +121,16 @@ fn apply_trim(
             let keep = max_len.max(0);
             let res = client.update(
                 "WITH to_delete AS ( \
-                    SELECT key, ms, seq FROM pg_redis_streams \
-                    WHERE key = $1 \
+                    SELECT db, key, ms, seq FROM pg_redis_streams \
+                    WHERE db = $1 AND key = $2 \
                     ORDER BY ms DESC, seq DESC \
-                    OFFSET $2 \
+                    OFFSET $3 \
                 ) \
                 DELETE FROM pg_redis_streams s USING to_delete d \
-                WHERE s.key = d.key AND s.ms = d.ms AND s.seq = d.seq",
+                WHERE s.db = d.db AND s.key = d.key AND s.ms = d.ms AND s.seq = d.seq",
                 None,
                 Some(vec![
+                    (PgBuiltInOids::INT2OID.oid(), db.into_datum()),
                     (PgBuiltInOids::TEXTOID.oid(), key.into_datum()),
                     (PgBuiltInOids::INT8OID.oid(), keep.into_datum()),
                 ]),
@@ -135,9 +140,10 @@ fn apply_trim(
         StreamTrimStrategy::MinId(min_ms, min_seq) => {
             let res = client.update(
                 "DELETE FROM pg_redis_streams \
-                 WHERE key = $1 AND (ms < $2 OR (ms = $2 AND seq < $3))",
+                 WHERE db = $1 AND key = $2 AND (ms < $3 OR (ms = $3 AND seq < $4))",
                 None,
                 Some(vec![
+                    (PgBuiltInOids::INT2OID.oid(), db.into_datum()),
                     (PgBuiltInOids::TEXTOID.oid(), key.into_datum()),
                     (PgBuiltInOids::INT8OID.oid(), min_ms.into_datum()),
                     (PgBuiltInOids::INT8OID.oid(), min_seq.into_datum()),
@@ -151,8 +157,9 @@ fn apply_trim(
 /// `XADD key [NOMKSTREAM] [MAXLEN|MINID [=|~] threshold [LIMIT count]] (* | id) field value [field value ...]`
 pub fn cmd_xadd(
     client: &mut SpiClient,
+    db: i16,
     args: &[Bytes],
-    mutated_keys: &mut Vec<String>,
+    mutated_keys: &mut Vec<(i16, String)>,
 ) -> SpiResult<RespValue> {
     if args.len() < 5 {
         return Ok(RespValue::wrong_arity("xadd"));
@@ -221,8 +228,8 @@ pub fn cmd_xadd(
         return Ok(RespValue::wrong_arity("xadd"));
     }
 
-    keys::purge_if_expired_non_string(client, &key)?;
-    let last_id = get_last_stream_id(client, &key)?;
+    keys::purge_if_expired_non_string(client, db, &key)?;
+    let last_id = get_last_stream_id(client, db, &key)?;
     if nomkstream && last_id.is_none() {
         return Ok(RespValue::Null);
     }
@@ -268,9 +275,10 @@ pub fn cmd_xadd(
 
     let fields_json = encode_entry_fields(field_args);
     client.update(
-        "INSERT INTO pg_redis_streams (key, ms, seq, fields) VALUES ($1, $2, $3, $4)",
+        "INSERT INTO pg_redis_streams (db, key, ms, seq, fields) VALUES ($1, $2, $3, $4, $5)",
         None,
         Some(vec![
+            (PgBuiltInOids::INT2OID.oid(), db.into_datum()),
             (PgBuiltInOids::TEXTOID.oid(), key.clone().into_datum()),
             (PgBuiltInOids::INT8OID.oid(), ms.into_datum()),
             (PgBuiltInOids::INT8OID.oid(), seq.into_datum()),
@@ -279,15 +287,15 @@ pub fn cmd_xadd(
     )?;
 
     if let Some(strategy) = trim {
-        let _ = apply_trim(client, &key, strategy)?;
+        let _ = apply_trim(client, db, &key, strategy)?;
     }
 
-    mutated_keys.push(key);
+    mutated_keys.push((db, key));
     Ok(RespValue::bulk(format!("{ms}-{seq}")))
 }
 
 /// `XTRIM key MAXLEN|MINID [=|~] threshold [LIMIT count]`
-pub fn cmd_xtrim(client: &mut SpiClient, args: &[Bytes]) -> SpiResult<RespValue> {
+pub fn cmd_xtrim(client: &mut SpiClient, db: i16, args: &[Bytes]) -> SpiResult<RespValue> {
     if args.len() < 4 {
         return Ok(RespValue::wrong_arity("xtrim"));
     }
@@ -318,30 +326,33 @@ pub fn cmd_xtrim(client: &mut SpiClient, args: &[Bytes]) -> SpiResult<RespValue>
         _ => return Ok(RespValue::syntax_err()),
     };
 
-    if keys::purge_if_expired_non_string(client, &key)? {
+    if keys::purge_if_expired_non_string(client, db, &key)? {
         return Ok(RespValue::Integer(0));
     }
 
-    let deleted = apply_trim(client, &key, strategy)?;
+    let deleted = apply_trim(client, db, &key, strategy)?;
     if deleted > 0 {
-        keys::cleanup_expiry_if_empty(client, "pg_redis_streams", &key)?;
+        keys::cleanup_expiry_if_empty(client, "pg_redis_streams", db, &key)?;
     }
     Ok(RespValue::Integer(deleted))
 }
 
-pub fn cmd_xlen(client: &SpiClient, args: &[Bytes]) -> SpiResult<RespValue> {
+pub fn cmd_xlen(client: &SpiClient, db: i16, args: &[Bytes]) -> SpiResult<RespValue> {
     if args.len() != 2 {
         return Ok(RespValue::wrong_arity("xlen"));
     }
     let key = as_str(&args[1]);
-    if keys::is_non_string_expired(client, &key)? {
+    if keys::is_non_string_expired(client, db, &key)? {
         return Ok(RespValue::Integer(0));
     }
     let count = client
         .select(
-            "SELECT COUNT(*)::BIGINT FROM pg_redis_streams WHERE key = $1",
+            "SELECT COUNT(*)::BIGINT FROM pg_redis_streams WHERE db = $1 AND key = $2",
             None,
-            Some(vec![(PgBuiltInOids::TEXTOID.oid(), key.into_datum())]),
+            Some(vec![
+                (PgBuiltInOids::INT2OID.oid(), db.into_datum()),
+                (PgBuiltInOids::TEXTOID.oid(), key.into_datum()),
+            ]),
         )?
         .first()
         .get_one::<i64>()?
@@ -349,12 +360,12 @@ pub fn cmd_xlen(client: &SpiClient, args: &[Bytes]) -> SpiResult<RespValue> {
     Ok(RespValue::Integer(count))
 }
 
-pub fn cmd_xdel(client: &mut SpiClient, args: &[Bytes]) -> SpiResult<RespValue> {
+pub fn cmd_xdel(client: &mut SpiClient, db: i16, args: &[Bytes]) -> SpiResult<RespValue> {
     if args.len() < 3 {
         return Ok(RespValue::wrong_arity("xdel"));
     }
     let key = as_str(&args[1]);
-    if keys::purge_if_expired_non_string(client, &key)? {
+    if keys::purge_if_expired_non_string(client, db, &key)? {
         return Ok(RespValue::Integer(0));
     }
     let mut deleted: i64 = 0;
@@ -365,9 +376,10 @@ pub fn cmd_xdel(client: &mut SpiClient, args: &[Bytes]) -> SpiResult<RespValue> 
             return Ok(RespValue::err("ERR Invalid stream ID specified as stream command argument"));
         };
         let res = client.update(
-            "DELETE FROM pg_redis_streams WHERE key = $1 AND ms = $2 AND seq = $3",
+            "DELETE FROM pg_redis_streams WHERE db = $1 AND key = $2 AND ms = $3 AND seq = $4",
             None,
             Some(vec![
+                (PgBuiltInOids::INT2OID.oid(), db.into_datum()),
                 (PgBuiltInOids::TEXTOID.oid(), key.clone().into_datum()),
                 (PgBuiltInOids::INT8OID.oid(), ms.into_datum()),
                 (PgBuiltInOids::INT8OID.oid(), seq.into_datum()),
@@ -377,13 +389,13 @@ pub fn cmd_xdel(client: &mut SpiClient, args: &[Bytes]) -> SpiResult<RespValue> 
     }
 
     if deleted > 0 {
-        keys::cleanup_expiry_if_empty(client, "pg_redis_streams", &key)?;
+        keys::cleanup_expiry_if_empty(client, "pg_redis_streams", db, &key)?;
     }
 
     Ok(RespValue::Integer(deleted))
 }
 
-pub fn cmd_xrange(client: &SpiClient, args: &[Bytes], rev: bool) -> SpiResult<RespValue> {
+pub fn cmd_xrange(client: &SpiClient, db: i16, args: &[Bytes], rev: bool) -> SpiResult<RespValue> {
     let name = if rev { "xrevrange" } else { "xrange" };
     if args.len() < 4 {
         return Ok(RespValue::wrong_arity(name));
@@ -413,7 +425,7 @@ pub fn cmd_xrange(client: &SpiClient, args: &[Bytes], rev: bool) -> SpiResult<Re
         return Ok(RespValue::syntax_err());
     }
 
-    if keys::is_non_string_expired(client, &key)? {
+    if keys::is_non_string_expired(client, db, &key)? {
         return Ok(RespValue::Array(Vec::new()));
     }
 
@@ -431,9 +443,9 @@ pub fn cmd_xrange(client: &SpiClient, args: &[Bytes], rev: bool) -> SpiResult<Re
 
     let sql = format!(
         "SELECT ms, seq, fields FROM pg_redis_streams \
-         WHERE key = $1 \
-           AND (ms, seq) {start_cmp} ($2, $3) \
-           AND (ms, seq) {end_cmp} ($4, $5) \
+         WHERE db = $1 AND key = $2 \
+           AND (ms, seq) {start_cmp} ($3, $4) \
+           AND (ms, seq) {end_cmp} ($5, $6) \
          ORDER BY {order} {limit_clause}"
     );
 
@@ -441,6 +453,7 @@ pub fn cmd_xrange(client: &SpiClient, args: &[Bytes], rev: bool) -> SpiResult<Re
         &sql,
         None,
         Some(vec![
+            (PgBuiltInOids::INT2OID.oid(), db.into_datum()),
             (PgBuiltInOids::TEXTOID.oid(), key.into_datum()),
             (PgBuiltInOids::INT8OID.oid(), start_ms.into_datum()),
             (PgBuiltInOids::INT8OID.oid(), start_seq.into_datum()),
@@ -534,15 +547,16 @@ pub fn parse_xread_args(args: &[Bytes]) -> Result<XReadRequest, RespValue> {
 /// so subsequent blocking wakeups read entries added strictly AFTER `XREAD` started.
 pub fn resolve_xread_ids(
     client: &SpiClient,
+    db: i16,
     streams: &[(String, String)],
 ) -> SpiResult<Result<Vec<(String, i64, i64)>, RespValue>> {
     let mut resolved = Vec::with_capacity(streams.len());
     for (key, id_str) in streams {
         if id_str == "$" {
-            let (ms, seq) = if keys::is_non_string_expired(client, key)? {
+            let (ms, seq) = if keys::is_non_string_expired(client, db, key)? {
                 (0, 0)
             } else {
-                get_last_stream_id(client, key)?.unwrap_or((0, 0))
+                get_last_stream_id(client, db, key)?.unwrap_or((0, 0))
             };
             resolved.push((key.clone(), ms, seq));
         } else {
@@ -561,6 +575,7 @@ pub fn resolve_xread_ids(
 /// Returns `Ok(Some(RespValue))` when at least one stream has new entries, or `Ok(None)` when empty.
 pub fn execute_xread_resolved(
     client: &SpiClient,
+    db: i16,
     resolved: &[(String, i64, i64)],
     count: Option<i64>,
 ) -> SpiResult<Option<RespValue>> {
@@ -570,20 +585,21 @@ pub fn execute_xread_resolved(
     };
     let sql = format!(
         "SELECT ms, seq, fields FROM pg_redis_streams \
-         WHERE key = $1 AND (ms > $2 OR (ms = $2 AND seq > $3)) \
+         WHERE db = $1 AND key = $2 AND (ms > $3 OR (ms = $3 AND seq > $4)) \
          ORDER BY ms ASC, seq ASC {limit_clause}"
     );
 
     let mut stream_results: Vec<RespValue> = Vec::new();
 
     for (key, after_ms, after_seq) in resolved {
-        if keys::is_non_string_expired(client, key)? {
+        if keys::is_non_string_expired(client, db, key)? {
             continue;
         }
         let table = client.select(
             &sql,
             None,
             Some(vec![
+                (PgBuiltInOids::INT2OID.oid(), db.into_datum()),
                 (PgBuiltInOids::TEXTOID.oid(), key.clone().into_datum()),
                 (PgBuiltInOids::INT8OID.oid(), (*after_ms).into_datum()),
                 (PgBuiltInOids::INT8OID.oid(), (*after_seq).into_datum()),
@@ -618,16 +634,20 @@ pub fn execute_xread_resolved(
     }
 }
 
-pub fn cmd_xread_nonblocking(client: &SpiClient, args: &[Bytes]) -> SpiResult<RespValue> {
+pub fn cmd_xread_nonblocking(
+    client: &SpiClient,
+    db: i16,
+    args: &[Bytes],
+) -> SpiResult<RespValue> {
     let req = match parse_xread_args(args) {
         Ok(r) => r,
         Err(e) => return Ok(e),
     };
-    let resolved = match resolve_xread_ids(client, &req.streams)? {
+    let resolved = match resolve_xread_ids(client, db, &req.streams)? {
         Ok(r) => r,
         Err(e) => return Ok(e),
     };
-    match execute_xread_resolved(client, &resolved, req.count)? {
+    match execute_xread_resolved(client, db, &resolved, req.count)? {
         Some(v) => Ok(v),
         None => Ok(RespValue::Null),
     }

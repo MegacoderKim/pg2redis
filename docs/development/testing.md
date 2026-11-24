@@ -18,11 +18,11 @@ This script verifies all RFC acceptance criteria in sequence:
 4. **Go Integration Suite (`test-go`):** Runs `go-redis/v9` with default RESP3 negotiation across all data types, `ZRangeWithScores`, `Pipeline`, and `TxPipeline`.
 5. **Kotlin Integration Suite (`test-kotlin`):** Runs `Jedis 5.2.0` across Strings, Counters, Hashes, Lists, Sorted Sets, and pipelining.
 6. **BullMQ 5.13.0 Suite (`test-bullmq`):** Runs unmodified `bullmq@5.13.0` covering Lua 5.1 (`EVAL`/`EVALSHA`/`SCRIPT LOAD`/`cjson`/`cmsgpack`), Streams (`XADD`/`XREAD BLOCK`), and cooperative `BZPOPMIN`.
-7. **Pub/Sub & v0.4.0 Suite (`test-pubsub`):** Runs `ioredis@5.11.1` + `bullmq@5.13.0` covering named & pattern Pub/Sub (`SUBSCRIBE`/`PSUBSCRIBE`/`PUBSUB`), universal TTL across all 6 data types (`NX|XX|GT|LT`, `GETEX`), `HSCAN`/`SSCAN`/`ZSCAN`/`SCAN TYPE`, multi-client `CLIENT LIST`/`KILL`, BullMQ `FlowProducer` `getDependencies()` & `getWorkers()`, and Lua sandbox verification.
+7. **Pub/Sub, v0.4.0 & Multi-DB Suites (`test-pubsub`, `test_multidb.mjs`):** Runs `ioredis@5.11.1` + `bullmq@5.13.0` covering named & pattern Pub/Sub (`SUBSCRIBE`/`PSUBSCRIBE`/`PUBSUB`), universal TTL across all 6 data types (`NX|XX|GT|LT`, `GETEX`), `HSCAN`/`SSCAN`/`ZSCAN`/`SCAN TYPE`, multi-client `CLIENT LIST`/`KILL`, BullMQ `FlowProducer` `getDependencies()` & `getWorkers()`, Lua sandbox verification, and logical multi-database isolation (`SELECT 0..15`, `MOVE`, `SWAPDB`, `FLUSHDB` vs `FLUSHALL`, per-DB blocking wakeups).
 8. **v0.4.0 Security & Limits Suite (`./tests/test_v040_security.sh`):** Verifies `pg_redis.requirepass` (`NOAUTH`/`WRONGPASS`/`AUTH`/`HELLO AUTH`/`RESET`), `pg_redis.lua_time_limit_ms` runaway script termination, `pg_redis.max_clients`, and `pg_redis.max_frame_bytes`.
 9. **v0.5.0 Optional TLS & mTLS Suite (`./tests/test_v050_tls.sh`):** Verifies dual-port mode (plain `:6379` + `rediss://:6380` with cross-transport Pub/Sub, `BZPOPMIN` over TLS, and `redis-cli --tls`), TLS-only + mTLS mode (`port = 0`, `tls_auth_clients = 'yes'`), and live `SIGHUP` certificate hot-reload (`SELECT pg_reload_conf();`).
 10. **PostgreSQL 15 & 16 DB Isolation Suite (`./tests/test_solar_nest_isolation.sh 15 16`):** Exercises both PG 15 and PG 16 with `pg_redis.database=solar_nest_redis` kept isolated from application DB `solar_nest` alongside `test-pubsub` and `test-bullmq`.
-11. **In-PostgreSQL `pgrx` Unit Tests & `cargo pgrx run` (`dev` target):** Runs `cargo pgrx test pg15` / `pg16` (all 12 `#[pg_test]` cases) and smoke-tests `cargo pgrx run`.
+11. **In-PostgreSQL `pgrx` Unit Tests & `cargo pgrx run` (`dev` target):** Runs `cargo pgrx test pg15` / `pg16` (all 13 `#[pg_test]` cases) and smoke-tests `cargo pgrx run`.
 
 ## Running `cargo pgrx` Directly via Docker
 
@@ -89,7 +89,7 @@ pg2redis/
 │   ├── Dockerfile.docs                  # MkDocs Material build/preview container
 │   ├── init.sql                         # CREATE EXTENSION IF NOT EXISTS pg_redis_core;
 │   └── postgresql.conf                  # Reference PostgreSQL + pg_redis.* GUC configuration
-├── sql/                                 # Incremental PostgreSQL extension upgrade scripts (0.1.0 -> 0.5.0)
+├── sql/                                 # Incremental PostgreSQL extension upgrade scripts (0.1.0 -> 0.6.0)
 ├── src/
 │   ├── lib.rs                           # extension_sql!, _PG_init, redis_dispatcher, SQL helpers, #[pg_test]
 │   ├── config.rs                        # PostgreSQL GUC definitions (pg_redis.* + constant-time AUTH compare)

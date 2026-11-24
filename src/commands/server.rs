@@ -66,7 +66,7 @@ pub fn cmd_select(
     let Ok(db) = std::str::from_utf8(&args[1]).unwrap_or("").parse::<i64>() else {
         return RespValue::err("ERR value is not an integer or out of range");
     };
-    if db != 0 {
+    if db < 0 || db >= config::databases() {
         return RespValue::err("ERR DB index is out of range");
     }
     conn.selected_db = db;
@@ -323,9 +323,10 @@ pub fn cmd_command(args: &[Bytes]) -> RespValue {
         "script", "get", "getex", "set", "setex", "psetex", "setnx", "getset", "getdel", "mget",
         "mset", "incr", "incrby", "decr", "decrby", "incrbyfloat", "append", "strlen", "del",
         "unlink", "exists", "expire", "pexpire", "expireat", "pexpireat", "expiretime",
-        "pexpiretime", "ttl", "pttl", "persist", "type", "rename", "keys", "scan", "dbsize",
-        "flushdb", "flushall", "hset", "hmset", "hsetnx", "hget", "hmget", "hgetall", "hdel",
-        "hexists", "hlen", "hkeys", "hvals", "hincrby", "hincrbyfloat", "hscan", "lpush", "rpush",
+        "pexpiretime", "ttl", "pttl", "persist", "type", "rename", "move", "swapdb", "keys", "scan",
+        "dbsize", "flushdb", "flushall", "hset", "hmset", "hsetnx", "hget", "hmget", "hgetall",
+        "hdel", "hexists", "hlen", "hkeys", "hvals", "hincrby", "hincrbyfloat", "hscan", "lpush",
+        "rpush",
         "lpop", "rpop", "lrange", "llen", "lindex", "lset", "lrem", "ltrim", "lpos", "rpoplpush",
         "lmove", "blpop", "brpop", "zadd", "zrange", "zrevrange", "zrangebyscore",
         "zrevrangebyscore", "zrem", "zremrangebyrank", "zremrangebyscore", "zpopmin", "zpopmax",
@@ -369,6 +370,7 @@ pub fn cmd_info(cache: Option<&L1Cache>, clients: Option<&ClientRegistry>) -> Re
          pg_redis_core_version:{}\r\n\
          tcp_port:{}\r\n\
          tls_port:{}\r\n\
+         databases:{}\r\n\
          pg_database:{}\r\n\
          pg_unlogged:{}\r\n\
          \r\n\
@@ -386,6 +388,7 @@ pub fn cmd_info(cache: Option<&L1Cache>, clients: Option<&ClientRegistry>) -> Re
         env!("CARGO_PKG_VERSION"),
         config::port(),
         config::tls_port(),
+        config::databases(),
         config::database(),
         if config::unlogged() { 1 } else { 0 },
         connected_clients,
@@ -400,7 +403,7 @@ pub fn cmd_config(args: &[Bytes]) -> RespValue {
     if args.len() >= 3 && as_str(&args[1]).eq_ignore_ascii_case("GET") {
         let pat = as_str(&args[2]).to_lowercase();
         let all = [
-            ("databases", "1".to_string()),
+            ("databases", config::databases().to_string()),
             ("save", "".to_string()),
             ("appendonly", "yes".to_string()),
             ("maxmemory-policy", "noeviction".to_string()),

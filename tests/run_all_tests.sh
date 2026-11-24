@@ -41,9 +41,10 @@ echo "============================================================"
 docker compose --profile test run --rm --build test-bullmq
 
 echo "============================================================"
-echo " 7. Running Node.js ioredis 5.11.1 Pub/Sub & v0.4.0 suite"
+echo " 7. Running Node.js ioredis 5.11.1 Pub/Sub, v0.4.0 & Multi-DB suites"
 echo "============================================================"
 docker compose --profile test run --rm --build test-pubsub
+docker compose --profile test run --rm test-pubsub node test_multidb.mjs
 
 echo "============================================================"
 echo " 8. Running v0.4.0 Security & Limits suite (AUTH, Lua, limits)"

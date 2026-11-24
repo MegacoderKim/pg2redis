@@ -119,7 +119,7 @@ impl LuaEngine {
         cache: Option<&L1Cache>,
         pubsub: Option<&PubSubHub>,
         conn: &mut ConnectionState,
-        mutated_keys: &mut Vec<String>,
+        mutated_keys: &mut Vec<(i16, String)>,
     ) -> RespValue {
         let sha = match self.script_load(source) {
             Ok(s) => s,
@@ -148,7 +148,7 @@ impl LuaEngine {
         cache: Option<&L1Cache>,
         pubsub: Option<&PubSubHub>,
         conn: &mut ConnectionState,
-        mutated_keys: &mut Vec<String>,
+        mutated_keys: &mut Vec<(i16, String)>,
     ) -> RespValue {
         let sha_lower = sha.to_ascii_lowercase();
         let func: Function = {
@@ -177,7 +177,7 @@ impl LuaEngine {
             cache: Option<&'a L1Cache>,
             pubsub: Option<&'a PubSubHub>,
             conn: &'a mut ConnectionState,
-            mutated_keys: &'a mut Vec<String>,
+            mutated_keys: &'a mut Vec<(i16, String)>,
         }
 
         let ctx_cell = RefCell::new(BridgeCtx {
