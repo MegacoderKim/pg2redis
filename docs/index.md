@@ -12,6 +12,7 @@ hide:
   <span class="hero-badge">RESP2 &amp; RESP3</span>
   <span class="hero-badge">Pub/Sub (Named &amp; Pattern)</span>
   <span class="hero-badge">Sandboxed Lua 5.1</span>
+  <span class="hero-badge">Optional TLS &amp; mTLS</span>
   <span class="hero-badge">AUTH &amp; Universal TTL</span>
   <span class="hero-badge">BullMQ 5.13 Ready</span>
 </div>
@@ -81,11 +82,11 @@ Speak native **Redis (RESP2 &amp; RESP3)** on port `6379` directly inside **Post
 
     Zero-SPI-overhead `PUBLISH`, `SUBSCRIBE`, `UNSUBSCRIBE`, `PSUBSCRIBE`, `PUNSUBSCRIBE`, and `PUBSUB` (`CHANNELS`/`NUMSUB`/`NUMPAT`) supporting binary-safe payloads far beyond PostgreSQL's 8 KB `NOTIFY` limit with bounded slow-consumer queues.
 
--   :material-shield-lock:{ .lg .middle } **Production Security & Resource Limits**
+-   :material-shield-lock:{ .lg .middle } **Optional Native TLS, AUTH & Resource Limits**
 
     ---
 
-    Constant-time `AUTH` & `HELLO ... AUTH` (`pg_redis.requirepass`), sandboxed Lua 5.1 VM with configurable execution timeout (`pg_redis.lua_time_limit_ms`), connection caps (`pg_redis.max_clients`), and frame memory bounds (`pg_redis.max_frame_bytes`).
+    Opt-in TLS 1.2/1.3 & mTLS (`rediss://` via `tokio-rustls`, plain-only / dual-port / TLS-only modes, live `SIGHUP` cert reload), constant-time `AUTH` & `HELLO ... AUTH` (`pg_redis.requirepass`), sandboxed Lua 5.1 with timeout (`pg_redis.lua_time_limit_ms`), `pg_redis.max_clients`, and `pg_redis.max_frame_bytes`.
 
 </div>
 

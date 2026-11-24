@@ -12,7 +12,7 @@
 ## Architecture
 
 - **Embedded RESP Listener (`src/worker.rs`, `src/protocol.rs`):** A PostgreSQL background worker runs a single-threaded Tokio (`current_thread` + `LocalSet`) TCP server on `0.0.0.0:6379` with zero-copy `redis-protocol` 6.0 frame parsing, RESP2 & RESP3 (`HELLO 3`) negotiation, and inline command support.
-- **Security, Auth & Resource Safeguards (`src/config.rs`, `src/clients.rs`, `src/worker.rs`):** Constant-time `AUTH` and `HELLO ... AUTH` enforcement via `pg_redis.requirepass` (`SUPERUSER_ONLY`), connection caps (`pg_redis.max_clients`), per-connection frame size limits (`pg_redis.max_frame_bytes`), bounded Pub/Sub slow-consumer queues (`pg_redis.pubsub_queue_size`), and a live multi-connection `ClientRegistry` powering `CLIENT LIST`/`INFO`/`KILL` and `INFO # Clients`.
+- **Security, Optional Native TLS (`rediss://`) & Safeguards (`src/tls.rs`, `src/config.rs`, `src/clients.rs`, `src/worker.rs`):** Strictly opt-in TLS 1.2/1.3 & mTLS via `tokio-rustls` (`pg_redis.tls_port`, default `0` so plain TCP remains unchanged; supports plain-only, dual-port, or TLS-only `port = 0` plus live `SIGHUP` cert reload), constant-time `AUTH` and `HELLO ... AUTH` enforcement via `pg_redis.requirepass` (`SUPERUSER_ONLY`), connection caps (`pg_redis.max_clients`), per-connection frame size limits (`pg_redis.max_frame_bytes`), bounded Pub/Sub slow-consumer queues (`pg_redis.pubsub_queue_size`), and a live multi-connection `ClientRegistry` powering `CLIENT LIST`/`INFO`/`KILL` and `INFO # Clients`.
 - **In-Process Redis Pub/Sub (`src/pubsub.rs`):** Named-channel and glob-pattern `PUBLISH`, `SUBSCRIBE`, `UNSUBSCRIBE`, `PSUBSCRIBE`, `PUNSUBSCRIBE`, and `PUBSUB` (`CHANNELS`/`NUMSUB`/`NUMPAT`) with exact Redis acknowledgements, binary-safe payloads beyond PostgreSQL's 8 KB `NOTIFY` limit, bounded slow-consumer queues, strict FIFO ordering, non-blocking idle subscribers, and automatic RAII cleanup on disconnect — verified end-to-end with **`ioredis@5.11.1`** (Medusa 2.22.7 workflow notifications).
 - **Sandboxed Lua 5.1 Scripting (`src/lua.rs`):** Vendored Lua 5.1 via `mlua` restricted to safe stdlibs (`table`/`string`/`math`, no `os`/`io`/`package`/`debug`) with configurable execution timeouts (`pg_redis.lua_time_limit_ms`), supporting `EVAL`, `EVALSHA`, `SCRIPT LOAD/EXISTS/FLUSH`, `cjson`, `cmsgpack`, `bit`, and atomic `redis.call`/`pcall` execution inside PostgreSQL SPI transactions.
 - **Streams, Sets, Universal TTL & Scans (`src/commands/`):** Full `XADD`/`XREAD [BLOCK]`/`XRANGE`, `BZPOPMIN`/`BLPOP`, universal `EXPIRE`/`PEXPIRE` (`NX|XX|GT|LT`) and `EXPIRETIME`/`PEXPIRETIME` across all 6 data types (`pg_redis_key_expiry`), `HSCAN`/`SSCAN`/`ZSCAN`/`SCAN TYPE`, `GETEX`, and multi-client `CLIENT LIST`/`KILL` — verified end-to-end with **BullMQ 5.13.0** (Medusa queues) on both **PostgreSQL 15** and **PostgreSQL 16**.
@@ -79,7 +79,12 @@ Runs raw TCP RESP tests, Python (`FastAPI` + `redis-py` + `psycopg`), Go (`go-re
 | GUC | Default | Description |
 | --- | --- | --- |
 | `pg_redis.bind_address` | `0.0.0.0` | TCP bind address for RESP listener |
-| `pg_redis.port` | `6379` | TCP port for RESP listener |
+| `pg_redis.port` | `6379` | Plain TCP port for RESP listener (`0` disables plain TCP for TLS-only mode) |
+| `pg_redis.tls_port` | `0` | Optional TLS (`rediss://`) TCP port (`0` disables TLS; strictly opt-in) |
+| `pg_redis.tls_cert_file` | *(unset)* | PEM server certificate chain path (`SUPERUSER_ONLY`; required when `tls_port > 0`) |
+| `pg_redis.tls_key_file` | *(unset)* | PEM server private key path (`SUPERUSER_ONLY`; required when `tls_port > 0`) |
+| `pg_redis.tls_ca_cert_file` | *(unset)* | Optional PEM CA bundle path for mTLS client cert verification (`SUPERUSER_ONLY`) |
+| `pg_redis.tls_auth_clients` | `no` | mTLS client certificate policy: `no`, `optional`, or `yes` (`SUPERUSER_ONLY`) |
 | `pg_redis.database` | `postgres` | PostgreSQL database used by the background worker |
 | `pg_redis.unlogged` | `off` | Create auto-provisioned catalog tables as `UNLOGGED` |
 | `pg_redis.cache_enabled` | `on` | Toggle in-process `moka` L1 hot-key cache |

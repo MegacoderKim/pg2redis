@@ -7,6 +7,7 @@ mod notify;
 mod protocol;
 mod pubsub;
 mod storage;
+mod tls;
 mod worker;
 
 use bytes::Bytes;
@@ -671,6 +672,48 @@ mod tests {
             crate::redis_dispatcher("SCARD".to_string(), Some("s:ttl".to_string()), None, None),
             ":0\r\n"
         );
+    }
+
+    #[pg_test]
+    fn test_tls_opt_in_defaults_and_auth_mode() {
+        // TLS must remain strictly opt-in (disabled by default) while plain TCP stays on 6379
+        assert_eq!(crate::config::port(), 6379);
+        assert_eq!(crate::config::tls_port(), 0);
+        assert_eq!(crate::config::tls_auth_clients(), "no");
+        assert!(crate::config::tls_cert_file().is_none());
+        assert!(crate::config::tls_key_file().is_none());
+        assert!(crate::config::tls_ca_cert_file().is_none());
+
+        assert_eq!(
+            crate::tls::parse_auth_mode("no"),
+            Ok(crate::tls::TlsAuthMode::No)
+        );
+        assert_eq!(
+            crate::tls::parse_auth_mode("optional"),
+            Ok(crate::tls::TlsAuthMode::Optional)
+        );
+        assert_eq!(
+            crate::tls::parse_auth_mode("YES"),
+            Ok(crate::tls::TlsAuthMode::Yes)
+        );
+        assert!(crate::tls::parse_auth_mode("invalid").is_err());
+
+        // Missing cert/key must fail closed when TLS is requested
+        assert!(crate::tls::build_tls_acceptor_from_config().is_err());
+
+        // INFO and CONFIG GET expose tls_port / tls-port / tls-auth-clients
+        let info = crate::redis_dispatcher("INFO".to_string(), None, None, None);
+        assert!(info.contains("tcp_port:6379"), "info={info}");
+        assert!(info.contains("tls_port:0"), "info={info}");
+
+        let cfg_tls = crate::redis_dispatcher(
+            "CONFIG".to_string(),
+            Some("GET".to_string()),
+            Some("tls-*".to_string()),
+            None,
+        );
+        assert!(cfg_tls.contains("tls-port"), "cfg_tls={cfg_tls}");
+        assert!(cfg_tls.contains("tls-auth-clients"), "cfg_tls={cfg_tls}");
     }
 }
 

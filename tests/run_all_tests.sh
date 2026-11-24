@@ -51,7 +51,12 @@ echo "============================================================"
 bash ./tests/test_v040_security.sh 15
 
 echo "============================================================"
-echo " 9. Running pgrx in-PostgreSQL tests (cargo pgrx test & run pg15)"
+echo " 9. Running v0.5.0 Optional TLS & mTLS suite (rediss://)"
+echo "============================================================"
+bash ./tests/test_v050_tls.sh 15
+
+echo "============================================================"
+echo " 10. Running pgrx in-PostgreSQL tests (cargo pgrx test & run pg15)"
 echo "============================================================"
 docker build --target dev --build-arg PG_MAJOR=15 -f docker/Dockerfile -t pg_redis_core:dev-pg15 .
 docker run --rm pg_redis_core:dev-pg15 sh -c "
