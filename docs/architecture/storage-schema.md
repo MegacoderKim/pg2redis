@@ -130,3 +130,4 @@ Schema evolutions are packaged as standard PostgreSQL extension migration files 
 - `sql/pg_redis_core--0.2.0--0.3.0.sql` — version bump for Pub/Sub & PostgreSQL 16 support.
 - `sql/pg_redis_core--0.3.0--0.4.0.sql` — adds `pg_redis_key_expiry` and `idx_redis_key_expiry_at`.
 - `sql/pg_redis_core--0.4.0--0.4.1.sql` — patch release upgrade marker.
+- `sql/pg_redis_core--0.4.1--0.5.0.sql` — optional native TLS (`rediss://`) & mTLS upgrade marker.

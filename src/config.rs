@@ -30,6 +30,20 @@ pub static MAX_FRAME_BYTES: GucSetting<i32> = GucSetting::<i32>::new(67_108_864)
 
 pub static PUBSUB_QUEUE_SIZE: GucSetting<i32> = GucSetting::<i32>::new(4_096);
 
+pub static TLS_PORT: GucSetting<i32> = GucSetting::<i32>::new(0);
+
+pub static TLS_CERT_FILE: GucSetting<Option<&'static CStr>> =
+    GucSetting::<Option<&'static CStr>>::new(None);
+
+pub static TLS_KEY_FILE: GucSetting<Option<&'static CStr>> =
+    GucSetting::<Option<&'static CStr>>::new(None);
+
+pub static TLS_CA_CERT_FILE: GucSetting<Option<&'static CStr>> =
+    GucSetting::<Option<&'static CStr>>::new(None);
+
+pub static TLS_AUTH_CLIENTS: GucSetting<Option<&'static CStr>> =
+    GucSetting::<Option<&'static CStr>>::new(Some(c"no"));
+
 pub fn register_gucs(in_shared_preload: bool) {
     // PostgreSQL forbids defining PGC_POSTMASTER GUCs after server startup (e.g., when
     // `CREATE EXTENSION pg_redis_core` is run without `shared_preload_libraries`).
@@ -52,10 +66,10 @@ pub fn register_gucs(in_shared_preload: bool) {
 
     GucRegistry::define_int_guc(
         "pg_redis.port",
-        "TCP port for the embedded RESP listener.",
-        "Defaults to the standard Redis port 6379.",
+        "TCP port for the embedded plain RESP listener (0 disables plain TCP).",
+        "Defaults to the standard Redis port 6379. Set to 0 with pg_redis.tls_port > 0 for TLS-only mode.",
         &PORT,
-        1,
+        0,
         65535,
         startup_ctx(),
         GucFlags::default(),
@@ -173,6 +187,53 @@ pub fn register_gucs(in_shared_preload: bool) {
         GucContext::Sighup,
         GucFlags::default(),
     );
+
+    GucRegistry::define_int_guc(
+        "pg_redis.tls_port",
+        "Optional TLS TCP port for encrypted rediss:// RESP connections (0 disables TLS).",
+        "Disabled by default (0). Set to e.g. 6380 along with tls_cert_file and tls_key_file to enable TLS.",
+        &TLS_PORT,
+        0,
+        65535,
+        startup_ctx(),
+        GucFlags::default(),
+    );
+
+    GucRegistry::define_string_guc(
+        "pg_redis.tls_cert_file",
+        "Path to the PEM-encoded server certificate chain for the optional TLS listener.",
+        "Required when pg_redis.tls_port > 0.",
+        &TLS_CERT_FILE,
+        GucContext::Sighup,
+        GucFlags::SUPERUSER_ONLY,
+    );
+
+    GucRegistry::define_string_guc(
+        "pg_redis.tls_key_file",
+        "Path to the PEM-encoded server private key for the optional TLS listener.",
+        "Required when pg_redis.tls_port > 0.",
+        &TLS_KEY_FILE,
+        GucContext::Sighup,
+        GucFlags::SUPERUSER_ONLY,
+    );
+
+    GucRegistry::define_string_guc(
+        "pg_redis.tls_ca_cert_file",
+        "Optional path to PEM-encoded CA certificates for mTLS client certificate verification.",
+        "Required when pg_redis.tls_auth_clients is 'yes' or 'optional'.",
+        &TLS_CA_CERT_FILE,
+        GucContext::Sighup,
+        GucFlags::SUPERUSER_ONLY,
+    );
+
+    GucRegistry::define_string_guc(
+        "pg_redis.tls_auth_clients",
+        "Client certificate verification mode for the optional TLS listener ('no', 'optional', or 'yes').",
+        "Defaults to 'no' (server TLS without client certificate requirement).",
+        &TLS_AUTH_CLIENTS,
+        GucContext::Sighup,
+        GucFlags::SUPERUSER_ONLY,
+    );
 }
 
 pub fn bind_address() -> String {
@@ -184,7 +245,7 @@ pub fn bind_address() -> String {
 }
 
 pub fn port() -> u16 {
-    PORT.get().clamp(1, 65535) as u16
+    PORT.get().clamp(0, 65535) as u16
 }
 
 pub fn database() -> String {
@@ -249,4 +310,41 @@ pub fn max_frame_bytes() -> usize {
 
 pub fn pubsub_queue_size() -> usize {
     PUBSUB_QUEUE_SIZE.get().max(16) as usize
+}
+
+pub fn tls_port() -> u16 {
+    TLS_PORT.get().clamp(0, 65535) as u16
+}
+
+pub fn tls_cert_file() -> Option<String> {
+    TLS_CERT_FILE
+        .get()
+        .and_then(|c| c.to_str().ok())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+}
+
+pub fn tls_key_file() -> Option<String> {
+    TLS_KEY_FILE
+        .get()
+        .and_then(|c| c.to_str().ok())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+}
+
+pub fn tls_ca_cert_file() -> Option<String> {
+    TLS_CA_CERT_FILE
+        .get()
+        .and_then(|c| c.to_str().ok())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+}
+
+pub fn tls_auth_clients() -> String {
+    TLS_AUTH_CLIENTS
+        .get()
+        .and_then(|c| c.to_str().ok())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_ascii_lowercase())
+        .unwrap_or_else(|| "no".to_string())
 }

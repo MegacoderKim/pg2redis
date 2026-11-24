@@ -23,6 +23,13 @@ pg_redis.lua_time_limit_ms = 5000
 pg_redis.max_clients = 1000
 pg_redis.max_frame_bytes = 67108864
 pg_redis.pubsub_queue_size = 4096
+
+# Optional native TLS / mTLS (disabled by default — strictly opt-in)
+pg_redis.tls_port = 0
+# pg_redis.tls_cert_file = '/etc/pg_redis/server.crt'
+# pg_redis.tls_key_file = '/etc/pg_redis/server.key'
+# pg_redis.tls_ca_cert_file = '/etc/pg_redis/ca.crt'
+# pg_redis.tls_auth_clients = 'no'   # 'no' | 'optional' | 'yes'
 ```
 
 !!! note "Dynamic extension loading (`CREATE EXTENSION` without preloading)"
@@ -33,7 +40,12 @@ pg_redis.pubsub_queue_size = 4096
 | Parameter | Type | Default | Context | Description |
 | --- | --- | --- | --- | --- |
 | `pg_redis.bind_address` | `text` | `'0.0.0.0'` | Postmaster | Interface address for the TCP RESP listener. |
-| `pg_redis.port` | `integer` | `6379` | Postmaster | TCP port bound by the embedded RESP server (`1`–`65535`). |
+| `pg_redis.port` | `integer` | `6379` | Postmaster | Plain TCP port bound by the embedded RESP server (`0`–`65535`; `0` disables plain TCP for TLS-only mode). |
+| `pg_redis.tls_port` | `integer` | `0` | Postmaster | Optional TLS (`rediss://`) TCP port (`0`–`65535`; `0` disables TLS — strictly opt-in). |
+| `pg_redis.tls_cert_file` | `text` | *(unset)* | SIGHUP (`SUPERUSER_ONLY`) | Path to PEM server certificate chain (required when `pg_redis.tls_port > 0`). |
+| `pg_redis.tls_key_file` | `text` | *(unset)* | SIGHUP (`SUPERUSER_ONLY`) | Path to PEM server private key (required when `pg_redis.tls_port > 0`). |
+| `pg_redis.tls_ca_cert_file` | `text` | *(unset)* | SIGHUP (`SUPERUSER_ONLY`) | Optional path to PEM CA bundle for mTLS client certificate verification. |
+| `pg_redis.tls_auth_clients` | `text` | `'no'` | SIGHUP (`SUPERUSER_ONLY`) | mTLS policy: `'no'` (default), `'optional'`, or `'yes'` (require valid CA-signed client cert). |
 | `pg_redis.database` | `text` | `'postgres'` | Postmaster | Target PostgreSQL database connected by the background worker via SPI. |
 | `pg_redis.unlogged` | `boolean` | `off` | SIGHUP | When `on`, auto-provisioned catalog tables are created as `UNLOGGED` to bypass WAL. |
 | `pg_redis.cache_enabled` | `boolean` | `on` | SIGHUP | Enables the in-process `moka` L1 hot-key cache for `GET` reads. |
@@ -55,6 +67,11 @@ SELECT pg_reload_conf();
 
 ## Security, Sandboxing & Resource Limits
 
+- **Optional Native TLS & mTLS (`pg_redis.tls_port`):** TLS is **strictly opt-in** (`pg_redis.tls_port = 0` by default) so non-TLS deployments on port `6379` work unchanged. Powered by pure-Rust `tokio-rustls` + `ring` (TLS 1.2 & TLS 1.3), supporting three modes:
+  - **Plain TCP only (default):** `pg_redis.port = 6379`, `pg_redis.tls_port = 0`.
+  - **Dual-port (Plain + TLS side-by-side):** `pg_redis.port = 6379`, `pg_redis.tls_port = 6380` with `pg_redis.tls_cert_file` and `pg_redis.tls_key_file`.
+  - **TLS-only (Encrypted only):** `pg_redis.port = 0`, `pg_redis.tls_port = 6380` (mirrors Redis `port 0` + `tls-port`), optionally combined with `pg_redis.tls_auth_clients = 'yes'` and `pg_redis.tls_ca_cert_file` for mutual TLS (mTLS).
+  - **Live Certificate Rotation:** Rotate PEM files on disk and run `SELECT pg_reload_conf();` (`SIGHUP`) to hot-reload certificates without restarting PostgreSQL or dropping active connections. If a reload fails, the worker logs a warning and continues serving with the previous valid configuration.
 - **Authentication (`pg_redis.requirepass`):** Defined with `SUPERUSER_ONLY` so non-superuser SQL roles cannot read or alter the password. When non-empty, every new RESP connection must authenticate via `AUTH <password>`, `AUTH default <password>`, or `HELLO <2|3> AUTH default <password>` (verified using constant-time byte comparison). Unauthenticated commands fail with `NOAUTH Authentication required`, invalid passwords return `WRONGPASS`, and `RESET` clears per-connection authentication state.
 - **Lua 5.1 Sandboxing & Timeouts (`pg_redis.lua_time_limit_ms`):** The embedded `mlua` Lua 5.1 VM loads only safe standard libraries (`table`, `string`, `math`) and removes `os`, `io`, `package`, `debug`, `dofile`, `loadfile`, `collectgarbage`, `module`, and `require`. An instruction hook aborts runaway scripts once execution exceeds `pg_redis.lua_time_limit_ms` (default `5000` ms; `0` disables).
 - **Connection & Frame Bounds (`pg_redis.max_clients`, `pg_redis.max_frame_bytes`):** Rejects incoming TCP connections once `connected_clients >= pg_redis.max_clients` (default `1000`) with `-ERR max number of clients reached`, and disconnects clients whose buffered RESP frame exceeds `pg_redis.max_frame_bytes` (default `64 MiB`).
@@ -72,7 +89,7 @@ Create the database and enable the extension inside it (`CREATE DATABASE app_red
 
 ## Upgrading Between Extension Versions
 
-`pg_redis_core` ships incremental SQL upgrade scripts (`sql/pg_redis_core--0.1.0--0.2.0.sql`, `0.2.0--0.3.0.sql`, `0.3.0--0.4.0.sql`, `0.4.0--0.4.1.sql`). After installing a newer extension package or image, run:
+`pg_redis_core` ships incremental SQL upgrade scripts (`sql/pg_redis_core--0.1.0--0.2.0.sql`, `0.2.0--0.3.0.sql`, `0.3.0--0.4.0.sql`, `0.4.0--0.4.1.sql`, `0.4.1--0.5.0.sql`). After installing a newer extension package or image, run:
 
 ```sql
 ALTER EXTENSION pg_redis_core UPDATE;

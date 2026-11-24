@@ -318,6 +318,72 @@ When `pg_redis.requirepass` is configured in PostgreSQL, every standard Redis dr
     redis-cli -a "$REDIS_PASSWORD" PING
     ```
 
+## Optional TLS (`rediss://`) & Mutual TLS (mTLS)
+
+TLS is disabled by default (`pg_redis.tls_port = 0`), leaving plain TCP on `:6379` unchanged. To opt in, set `pg_redis.tls_port = 6380`, `pg_redis.tls_cert_file`, and `pg_redis.tls_key_file` (and optionally `pg_redis.port = 0` for TLS-only mode or `pg_redis.tls_auth_clients = 'yes'` + `pg_redis.tls_ca_cert_file` for mTLS):
+
+=== "Node.js (ioredis / BullMQ)"
+
+    ```javascript
+    import fs from "node:fs";
+    import Redis from "ioredis";
+
+    // Server TLS (or add cert + key for mTLS when pg_redis.tls_auth_clients = 'yes')
+    const redis = new Redis({
+      host: "localhost",
+      port: 6380,
+      password: process.env.REDIS_PASSWORD,
+      tls: {
+        ca: fs.readFileSync("/etc/certs/ca.crt"),
+        // Optional mTLS client certificate:
+        // cert: fs.readFileSync("/etc/certs/client.crt"),
+        // key: fs.readFileSync("/etc/certs/client.key"),
+      },
+    });
+    console.log(await redis.ping()); // PONG
+    ```
+
+=== "Python (redis-py)"
+
+    ```python
+    import os
+    import redis.asyncio as redis
+
+    r = redis.Redis(
+        host="localhost",
+        port=6380,
+        password=os.environ["REDIS_PASSWORD"],
+        ssl=True,
+        ssl_ca_certs="/etc/certs/ca.crt",
+        # Optional mTLS:
+        # ssl_certfile="/etc/certs/client.crt",
+        # ssl_keyfile="/etc/certs/client.key",
+    )
+    await r.ping()  # True
+    ```
+
+=== "Go (go-redis/v9 RESP3)"
+
+    ```go
+    rdb := redis.NewClient(&redis.Options{
+        Addr:      "localhost:6380",
+        Password:  os.Getenv("REDIS_PASSWORD"),
+        TLSConfig: &tls.Config{RootCAs: caPool, MinVersion: tls.VersionTLS12},
+    })
+    ```
+
+=== "redis-cli"
+
+    ```bash
+    # Server TLS
+    redis-cli --tls --cacert /etc/certs/ca.crt -h localhost -p 6380 -a "$REDIS_PASSWORD" PING
+
+    # Mutual TLS (mTLS)
+    redis-cli --tls --cacert /etc/certs/ca.crt \
+      --cert /etc/certs/client.crt --key /etc/certs/client.key \
+      -h localhost -p 6380 -a "$REDIS_PASSWORD" PING
+    ```
+
 ## Universal TTL, Rolling Sessions (`GETEX`) & Collection Scans
 
 `pg_redis_core` supports universal expiration (`EXPIRE`/`PEXPIRE` with `NX|XX|GT|LT`, `EXPIRETIME`/`PEXPIRETIME`) across all 6 data types, rolling session TTLs via `GETEX` (`connect-redis`), and cursor-based scans (`SCAN TYPE`, `HSCAN [NOVALUES]`, `SSCAN`, `ZSCAN`) used by BullMQ `FlowProducer`:

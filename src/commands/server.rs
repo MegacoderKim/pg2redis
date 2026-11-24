@@ -368,6 +368,7 @@ pub fn cmd_info(cache: Option<&L1Cache>, clients: Option<&ClientRegistry>) -> Re
          redis_version:7.2.0\r\n\
          pg_redis_core_version:{}\r\n\
          tcp_port:{}\r\n\
+         tls_port:{}\r\n\
          pg_database:{}\r\n\
          pg_unlogged:{}\r\n\
          \r\n\
@@ -384,6 +385,7 @@ pub fn cmd_info(cache: Option<&L1Cache>, clients: Option<&ClientRegistry>) -> Re
          role:master\r\n",
         env!("CARGO_PKG_VERSION"),
         config::port(),
+        config::tls_port(),
         config::database(),
         if config::unlogged() { 1 } else { 0 },
         connected_clients,
@@ -405,6 +407,8 @@ pub fn cmd_config(args: &[Bytes]) -> RespValue {
             ("maxclients", config::max_clients().to_string()),
             ("lua-time-limit", config::lua_time_limit_ms().to_string()),
             ("port", config::port().to_string()),
+            ("tls-port", config::tls_port().to_string()),
+            ("tls-auth-clients", config::tls_auth_clients()),
         ];
         let mut pairs = Vec::new();
         for (k, v) in all {

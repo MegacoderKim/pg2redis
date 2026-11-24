@@ -151,7 +151,7 @@
 | `PING` / `ECHO` | `PING [msg]` / `ECHO msg` | Resolved in memory without SPI overhead (returns `["pong", msg]` in RESP2 subscribed mode) |
 | `RESET` | `RESET` | Unsubscribes all channels/patterns, clears `MULTI` state, resets auth & protocol to RESP2, returns `+RESET` |
 | `CLIENT` | `CLIENT SETINFO \| SETNAME \| GETNAME \| ID \| LIST \| INFO \| KILL \| MAINT_NOTIFICATIONS \| NO-EVICT \| NO-TOUCH` | Full multi-connection registry (`LIST [TYPE ...] [ID ...]`, `KILL [ID\|ADDR\|ip:port]`) for BullMQ `getWorkers()`, `go-redis/v9`, `redis-py`, `ioredis`, and `Jedis` |
-| `INFO` | `INFO [section]` | Reports `pg_redis_core` version, `# Clients` (`connected_clients`, `maxclients`), `# Memory` (`maxmemory_policy:noeviction`), `# Stats` (L1 cache hit/miss counters), and `# Replication` |
+| `INFO` | `INFO [section]` | Reports `pg_redis_core` version, `tcp_port`, `tls_port`, `# Clients` (`connected_clients`, `maxclients`), `# Memory` (`maxmemory_policy:noeviction`), `# Stats` (L1 cache hit/miss counters), and `# Replication` |
 | `COMMAND` | `COMMAND [COUNT \| DOCS \| LIST]` | `redis-cli` interactive startup compatibility (returns all 115 supported commands) |
-| `CONFIG GET` | `CONFIG GET pattern` | Glob-matched server config keys (`databases`, `save`, `appendonly`, `maxmemory-policy`, `maxclients`, `lua-time-limit`, `port`) |
+| `CONFIG GET` | `CONFIG GET pattern` | Glob-matched server config keys (`databases`, `save`, `appendonly`, `maxmemory-policy`, `maxclients`, `lua-time-limit`, `port`, `tls-port`, `tls-auth-clients`) |
 | `SELECT` / `TIME` / `QUIT` | Standard Redis syntax | Session lifecycle commands |

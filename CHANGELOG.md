@@ -2,6 +2,23 @@
 
 All notable changes to `pg_redis_core` are documented in this file.
 
+## [0.5.0] - 2026-11-24
+
+### Added
+- **Optional Native TLS (`rediss://`) & mTLS (`src/tls.rs`, `src/worker.rs`, `src/config.rs`):**
+  - Strictly **opt-in** via `pg_redis.tls_port` (default `0`, disabled) so plain non-TLS TCP on port `6379` continues working unchanged by default.
+  - Supports all three deployment modes:
+    1. **Plain TCP only (default):** `pg_redis.port = 6379`, `pg_redis.tls_port = 0`.
+    2. **Dual-port (Plain TCP + TLS simultaneously):** `pg_redis.port = 6379`, `pg_redis.tls_port = 6380` with `pg_redis.tls_cert_file` and `pg_redis.tls_key_file`.
+    3. **TLS-only (Encrypted only):** `pg_redis.port = 0`, `pg_redis.tls_port = 6380` (mirrors Redis `port 0` + `tls-port`).
+  - Optional **mutual TLS (mTLS)** client certificate authentication via `pg_redis.tls_ca_cert_file` and `pg_redis.tls_auth_clients` (`no` | `optional` | `yes`).
+  - Built on pure-Rust `tokio-rustls` + `ring` (TLS 1.2 & TLS 1.3) to avoid OpenSSL/`libssl` symbol conflicts with PostgreSQL, with non-blocking 10-second handshake timeouts so stalled handshakes never affect other clients.
+  - **Live Certificate Hot-Reload on `SIGHUP`:** `SELECT pg_reload_conf();` reloads `pg_redis.tls_cert_file`, `pg_redis.tls_key_file`, `pg_redis.tls_ca_cert_file`, and `pg_redis.tls_auth_clients` without restarting PostgreSQL (keeping the previous working configuration on reload error).
+  - Exposed `tls_port` in `INFO # Server` and `tls-port` / `tls-auth-clients` in `CONFIG GET`.
+- **Upgrade Script & E2E Tests:**
+  - Added `sql/pg_redis_core--0.4.1--0.5.0.sql`.
+  - Added `tests/test_v050_tls.sh` and `tests/clients/pubsub/test_tls.mjs` verifying dual-port mode (`ioredis` + `redis-cli --tls`, cross-transport Pub/Sub, `BZPOPMIN` over TLS, plaintext rejection on TLS port), TLS-only + mTLS enforcement, and live `SIGHUP` certificate hot-reload, plus `#[pg_test]` opt-in default checks.
+
 ## [0.4.1] - 2026-11-23
 
 ### Fixed

@@ -20,8 +20,9 @@ This script verifies all RFC acceptance criteria in sequence:
 6. **BullMQ 5.13.0 Suite (`test-bullmq`):** Runs unmodified `bullmq@5.13.0` covering Lua 5.1 (`EVAL`/`EVALSHA`/`SCRIPT LOAD`/`cjson`/`cmsgpack`), Streams (`XADD`/`XREAD BLOCK`), and cooperative `BZPOPMIN`.
 7. **Pub/Sub & v0.4.0 Suite (`test-pubsub`):** Runs `ioredis@5.11.1` + `bullmq@5.13.0` covering named & pattern Pub/Sub (`SUBSCRIBE`/`PSUBSCRIBE`/`PUBSUB`), universal TTL across all 6 data types (`NX|XX|GT|LT`, `GETEX`), `HSCAN`/`SSCAN`/`ZSCAN`/`SCAN TYPE`, multi-client `CLIENT LIST`/`KILL`, BullMQ `FlowProducer` `getDependencies()` & `getWorkers()`, and Lua sandbox verification.
 8. **v0.4.0 Security & Limits Suite (`./tests/test_v040_security.sh`):** Verifies `pg_redis.requirepass` (`NOAUTH`/`WRONGPASS`/`AUTH`/`HELLO AUTH`/`RESET`), `pg_redis.lua_time_limit_ms` runaway script termination, `pg_redis.max_clients`, and `pg_redis.max_frame_bytes`.
-9. **PostgreSQL 15 & 16 DB Isolation Suite (`./tests/test_solar_nest_isolation.sh 15 16`):** Exercises both PG 15 and PG 16 with `pg_redis.database=solar_nest_redis` kept isolated from application DB `solar_nest` alongside `test-pubsub` and `test-bullmq`.
-10. **In-PostgreSQL `pgrx` Unit Tests & `cargo pgrx run` (`dev` target):** Runs `cargo pgrx test pg15` / `pg16` (all 11 `#[pg_test]` cases) and smoke-tests `cargo pgrx run`.
+9. **v0.5.0 Optional TLS & mTLS Suite (`./tests/test_v050_tls.sh`):** Verifies dual-port mode (plain `:6379` + `rediss://:6380` with cross-transport Pub/Sub, `BZPOPMIN` over TLS, and `redis-cli --tls`), TLS-only + mTLS mode (`port = 0`, `tls_auth_clients = 'yes'`), and live `SIGHUP` certificate hot-reload (`SELECT pg_reload_conf();`).
+10. **PostgreSQL 15 & 16 DB Isolation Suite (`./tests/test_solar_nest_isolation.sh 15 16`):** Exercises both PG 15 and PG 16 with `pg_redis.database=solar_nest_redis` kept isolated from application DB `solar_nest` alongside `test-pubsub` and `test-bullmq`.
+11. **In-PostgreSQL `pgrx` Unit Tests & `cargo pgrx run` (`dev` target):** Runs `cargo pgrx test pg15` / `pg16` (all 12 `#[pg_test]` cases) and smoke-tests `cargo pgrx run`.
 
 ## Running `cargo pgrx` Directly via Docker
 
@@ -88,7 +89,7 @@ pg2redis/
 │   ├── Dockerfile.docs                  # MkDocs Material build/preview container
 │   ├── init.sql                         # CREATE EXTENSION IF NOT EXISTS pg_redis_core;
 │   └── postgresql.conf                  # Reference PostgreSQL + pg_redis.* GUC configuration
-├── sql/                                 # Incremental PostgreSQL extension upgrade scripts (0.1.0 -> 0.4.1)
+├── sql/                                 # Incremental PostgreSQL extension upgrade scripts (0.1.0 -> 0.5.0)
 ├── src/
 │   ├── lib.rs                           # extension_sql!, _PG_init, redis_dispatcher, SQL helpers, #[pg_test]
 │   ├── config.rs                        # PostgreSQL GUC definitions (pg_redis.* + constant-time AUTH compare)
@@ -99,12 +100,14 @@ pg2redis/
 │   ├── protocol.rs                      # Zero-copy RESP2/RESP3 codec (redis-protocol 6.0)
 │   ├── pubsub.rs                        # In-process named & pattern PubSubHub with bounded slow-consumer queues
 │   ├── storage.rs                       # 7-table catalog DDL, SPI PreparedPlans, universal ctid TTL eviction
-│   ├── worker.rs                        # BGWorker + Tokio current_thread/LocalSet TCP listener & limits
+│   ├── tls.rs                           # Optional native TLS 1.2/1.3 & mTLS acceptor (tokio-rustls + ring)
+│   ├── worker.rs                        # BGWorker + Tokio current_thread/LocalSet plain/TLS TCP listener & limits
 │   └── commands/                        # Command handlers (strings, keys, hashes, lists, zsets, sets, streams, server)
 ├── docs/                                # MkDocs Material documentation source
 └── tests/
     ├── raw_resp_test.sh                 # Raw TCP RESP2/RESP3 verification
     ├── test_v040_security.sh            # AUTH/requirepass, Lua timeout, max_clients & max_frame_bytes tests
+    ├── test_v050_tls.sh                 # Optional TLS (rediss://), dual-port, TLS-only + mTLS & SIGHUP reload tests
     ├── test_solar_nest_isolation.sh     # PG 15 & 16 isolated-DB + Pub/Sub + BullMQ suite
     ├── run_all_tests.sh                 # Master end-to-end verification runner
     └── clients/
